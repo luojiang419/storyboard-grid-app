@@ -326,10 +326,43 @@ class GridCutTaskGroup {
   }
 }
 
+enum GridCutTaskNodeKind { group, image }
+
+class GridCutTaskNodeRef {
+  const GridCutTaskNodeRef({required this.kind, required this.id});
+
+  const GridCutTaskNodeRef.group(String id)
+    : this(kind: GridCutTaskNodeKind.group, id: id);
+
+  const GridCutTaskNodeRef.image(String id)
+    : this(kind: GridCutTaskNodeKind.image, id: id);
+
+  final GridCutTaskNodeKind kind;
+  final String id;
+
+  String get key => '${kind.name}:$id';
+
+  static GridCutTaskNodeRef? tryParse(String value) {
+    final separator = value.indexOf(':');
+    if (separator <= 0 || separator == value.length - 1) {
+      return null;
+    }
+    final kindName = value.substring(0, separator);
+    final id = value.substring(separator + 1);
+    for (final kind in GridCutTaskNodeKind.values) {
+      if (kind.name == kindName) {
+        return GridCutTaskNodeRef(kind: kind, id: id);
+      }
+    }
+    return null;
+  }
+}
+
 class GridCutState {
   const GridCutState({
     required this.images,
     required this.taskGroups,
+    this.taskOrder = const [],
     required this.selectedImageId,
     required this.isBusy,
     required this.message,
@@ -339,6 +372,7 @@ class GridCutState {
   const GridCutState.initial()
     : images = const [],
       taskGroups = const [],
+      taskOrder = const [],
       selectedImageId = null,
       isBusy = false,
       message = '拖拽、手动添加或粘贴图片开始裁切',
@@ -346,6 +380,7 @@ class GridCutState {
 
   final List<GridCutImage> images;
   final List<GridCutTaskGroup> taskGroups;
+  final List<String> taskOrder;
   final String? selectedImageId;
   final bool isBusy;
   final String message;
@@ -363,6 +398,7 @@ class GridCutState {
   GridCutState copyWith({
     List<GridCutImage>? images,
     List<GridCutTaskGroup>? taskGroups,
+    List<String>? taskOrder,
     String? selectedImageId,
     bool clearSelectedImageId = false,
     bool? isBusy,
@@ -372,6 +408,7 @@ class GridCutState {
     return GridCutState(
       images: images ?? this.images,
       taskGroups: taskGroups ?? this.taskGroups,
+      taskOrder: taskOrder ?? this.taskOrder,
       selectedImageId: clearSelectedImageId
           ? null
           : selectedImageId ?? this.selectedImageId,

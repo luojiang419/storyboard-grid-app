@@ -86,7 +86,7 @@ class GridCutController extends ValueNotifier<GridCutState> {
   );
   static const _workspaceSnapshotKey = 'gridCutWorkspaceSnapshot';
   static const _selectionStateKey = 'gridCutWorkspaceSelection';
-  static const _workspaceSnapshotVersion = 1;
+  static const _workspaceSnapshotVersion = 2;
 
   final WorkspaceDirectories _directories;
   final AppDatabase _database;
@@ -217,8 +217,13 @@ class GridCutController extends ValueNotifier<GridCutState> {
       );
 
     _nextImportSequence++;
+    final imageNodeKey = GridCutTaskNodeRef.image(id).key;
     _setState(
-      value.copyWith(images: [...value.images, image], selectedImageId: id),
+      value.copyWith(
+        images: [...value.images, image],
+        taskOrder: [..._normalizedTaskOrder(value), imageNodeKey],
+        selectedImageId: id,
+      ),
     );
   }
 
@@ -273,6 +278,16 @@ class GridCutController extends ValueNotifier<GridCutState> {
       value.copyWith(
         images: nextImages,
         taskGroups: _groupsWithoutImages({imageId}, value.taskGroups),
+        taskOrder: _normalizedTaskOrder(
+          value.copyWith(
+            images: nextImages,
+            taskGroups: _groupsWithoutImages({imageId}, value.taskGroups),
+            taskOrder: [
+              for (final key in value.taskOrder)
+                if (key != GridCutTaskNodeRef.image(imageId).key) key,
+            ],
+          ),
+        ),
         selectedImageId: nextSelectedId,
         clearSelectedImageId: nextSelectedId == null,
         message: nextImages.isEmpty
@@ -292,6 +307,7 @@ class GridCutController extends ValueNotifier<GridCutState> {
       value.copyWith(
         images: const [],
         taskGroups: const [],
+        taskOrder: const [],
         clearSelectedImageId: true,
         message: '已清空 $count 张图片任务',
       ),
@@ -459,12 +475,116 @@ class GridCutController extends ValueNotifier<GridCutState> {
       ),
     );
 
+    final retainedGroupIds = nextGroups.map((group) => group.id).toSet();
+    final currentOrder = _normalizedTaskOrder(value);
+    final firstSelectedIndex = currentOrder.indexWhere((key) {
+      final node = GridCutTaskNodeRef.tryParse(key);
+      return node?.kind == GridCutTaskNodeKind.image &&
+          selectedIds.contains(node?.id);
+    });
+    final nextOrder = <String>[];
+    var insertionIndex = 0;
+    for (var index = 0; index < currentOrder.length; index++) {
+      final key = currentOrder[index];
+      final node = GridCutTaskNodeRef.tryParse(key);
+      final retained =
+          node != null &&
+          !(node.kind == GridCutTaskNodeKind.image &&
+              selectedIds.contains(node.id)) &&
+          (node.kind != GridCutTaskNodeKind.group ||
+              retainedGroupIds.contains(node.id));
+      if (retained) {
+        nextOrder.add(key);
+        if (firstSelectedIndex < 0 || index < firstSelectedIndex) {
+          insertionIndex++;
+        }
+      }
+    }
+    nextOrder.insert(
+      insertionIndex.clamp(0, nextOrder.length),
+      GridCutTaskNodeRef.group(nextGroups.last.id).key,
+    );
+
     _setState(
       value.copyWith(
         taskGroups: nextGroups,
+        taskOrder: nextOrder,
         message: '已将 ${selectedInImageOrder.length} 张图片任务编组到 $groupName',
       ),
     );
+  }
+
+  bool moveTaskNode(
+    String nodeKey, {
+    String? targetGroupId,
+    String? beforeNodeKey,
+  }) {
+    final node = GridCutTaskNodeRef.tryParse(nodeKey);
+    if (node == null) {
+      return false;
+    }
+    if (node.kind == GridCutTaskNodeKind.group && targetGroupId != null) {
+      _setMessage('图片任务编组仅支持在根层排序');
+      return false;
+    }
+    if (targetGroupId != null &&
+        !value.taskGroups.any((group) => group.id == targetGroupId)) {
+      return false;
+    }
+
+    var groups = [for (final group in value.taskGroups) group];
+    var rootOrder = _normalizedTaskOrder(value)..remove(nodeKey);
+    if (node.kind == GridCutTaskNodeKind.image) {
+      if (!value.images.any((image) => image.id == node.id)) {
+        return false;
+      }
+      groups = [
+        for (final group in groups)
+          group.copyWith(
+            imageIds: [
+              for (final imageId in group.imageIds)
+                if (imageId != node.id) imageId,
+            ],
+          ),
+      ];
+      if (targetGroupId == null) {
+        _insertBefore(rootOrder, nodeKey, beforeNodeKey);
+      } else {
+        groups = [
+          for (final group in groups)
+            if (group.id == targetGroupId)
+              group.copyWith(
+                imageIds: _withInsertedImage(
+                  group.imageIds,
+                  node.id,
+                  beforeNodeKey,
+                ),
+              )
+            else
+              group,
+        ];
+      }
+    } else {
+      if (!groups.any((group) => group.id == node.id)) {
+        return false;
+      }
+      _insertBefore(rootOrder, nodeKey, beforeNodeKey);
+    }
+
+    groups = groups.where((group) => group.imageIds.isNotEmpty).toList();
+    final nextState = value.copyWith(taskGroups: groups, taskOrder: rootOrder);
+    final normalizedOrder = _normalizedTaskOrder(nextState);
+    final orderedImages = _imagesInTaskOrder(
+      nextState.copyWith(taskOrder: normalizedOrder),
+    );
+    _setState(
+      nextState.copyWith(
+        images: orderedImages,
+        taskOrder: normalizedOrder,
+        message: '已调整图片任务顺序',
+      ),
+    );
+    return true;
   }
 
   void toggleTaskGroupExpanded(String groupId) {
@@ -670,13 +790,22 @@ class GridCutController extends ValueNotifier<GridCutState> {
               images.any((image) => image.id == selectedImageId)
           ? selectedImageId
           : images.first.id;
-      return GridCutState(
+      final taskGroups = _taskGroupsFromJson(decoded['taskGroups'], images);
+      final restored = GridCutState(
         images: images,
-        taskGroups: _taskGroupsFromJson(decoded['taskGroups'], images),
+        taskGroups: taskGroups,
+        taskOrder: _jsonStringList(decoded['taskOrder']),
         selectedImageId: restoredSelectedImageId,
         isBusy: false,
         message: '已恢复上次裁切任务',
         isDraggingOver: false,
+      );
+      final normalizedOrder = _normalizedTaskOrder(restored);
+      return restored.copyWith(
+        images: _imagesInTaskOrder(
+          restored.copyWith(taskOrder: normalizedOrder),
+        ),
+        taskOrder: normalizedOrder,
       );
     } catch (_) {
       return null;
@@ -690,6 +819,7 @@ class GridCutController extends ValueNotifier<GridCutState> {
       'selectedImageId': state.selectedImage?.id,
       'images': [for (final image in state.images) _imageToJson(image)],
       'taskGroups': [for (final group in state.taskGroups) _groupToJson(group)],
+      'taskOrder': _normalizedTaskOrder(state),
     };
   }
 
@@ -914,6 +1044,96 @@ class GridCutController extends ValueNotifier<GridCutState> {
     return [
       for (final group in groups) _groupWithoutImages(group, imageIds),
     ].where((group) => group.imageIds.isNotEmpty).toList();
+  }
+
+  List<String> _normalizedTaskOrder(GridCutState state) {
+    final imageIds = state.images.map((image) => image.id).toSet();
+    final groupedImageIds = {
+      for (final group in state.taskGroups) ...group.imageIds,
+    };
+    final groupIds = state.taskGroups
+        .where((group) => group.imageIds.any(imageIds.contains))
+        .map((group) => group.id)
+        .toSet();
+    final validKeys = <String>{
+      for (final groupId in groupIds) GridCutTaskNodeRef.group(groupId).key,
+      for (final imageId in imageIds)
+        if (!groupedImageIds.contains(imageId))
+          GridCutTaskNodeRef.image(imageId).key,
+    };
+    final result = <String>[];
+    final seen = <String>{};
+    for (final key in state.taskOrder) {
+      if (validKeys.contains(key) && seen.add(key)) {
+        result.add(key);
+      }
+    }
+    for (final group in state.taskGroups) {
+      final key = GridCutTaskNodeRef.group(group.id).key;
+      if (validKeys.contains(key) && seen.add(key)) {
+        result.add(key);
+      }
+    }
+    for (final image in state.images) {
+      final key = GridCutTaskNodeRef.image(image.id).key;
+      if (validKeys.contains(key) && seen.add(key)) {
+        result.add(key);
+      }
+    }
+    return result;
+  }
+
+  List<GridCutImage> _imagesInTaskOrder(GridCutState state) {
+    final imagesById = {for (final image in state.images) image.id: image};
+    final groupsById = {for (final group in state.taskGroups) group.id: group};
+    final result = <GridCutImage>[];
+    final seen = <String>{};
+    void addImage(String imageId) {
+      final image = imagesById[imageId];
+      if (image != null && seen.add(imageId)) {
+        result.add(image);
+      }
+    }
+
+    for (final key in _normalizedTaskOrder(state)) {
+      final node = GridCutTaskNodeRef.tryParse(key);
+      if (node?.kind == GridCutTaskNodeKind.image) {
+        addImage(node!.id);
+      } else if (node?.kind == GridCutTaskNodeKind.group) {
+        for (final imageId in groupsById[node!.id]?.imageIds ?? const []) {
+          addImage(imageId);
+        }
+      }
+    }
+    for (final image in state.images) {
+      addImage(image.id);
+    }
+    return result;
+  }
+
+  void _insertBefore(List<String> values, String value, String? beforeValue) {
+    values.remove(value);
+    final index = beforeValue == null ? -1 : values.indexOf(beforeValue);
+    values.insert(index < 0 ? values.length : index, value);
+  }
+
+  List<String> _withInsertedImage(
+    List<String> imageIds,
+    String imageId,
+    String? beforeNodeKey,
+  ) {
+    final result = [
+      for (final id in imageIds)
+        if (id != imageId) id,
+    ];
+    final before = beforeNodeKey == null
+        ? null
+        : GridCutTaskNodeRef.tryParse(beforeNodeKey);
+    final index = before?.kind == GridCutTaskNodeKind.image
+        ? result.indexOf(before!.id)
+        : -1;
+    result.insert(index < 0 ? result.length : index, imageId);
+    return result;
   }
 
   GridCutTaskGroup _groupWithoutImages(

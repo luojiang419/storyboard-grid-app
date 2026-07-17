@@ -97,7 +97,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
 
   static const _workspaceSnapshotKey = 'storyboardWorkspaceSnapshot';
   static const _selectionStateKey = 'storyboardWorkspaceSelection';
-  static const _workspaceSnapshotVersion = 2;
+  static const _workspaceSnapshotVersion = 3;
   static const _maxGridExtent = 12;
   static const _historyLimit = 100;
 
@@ -480,26 +480,61 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         if (movingFolderIds.contains(folder.id))
           for (final asset in folder.assets) asset.id,
     };
+    final currentTree = _normalizeResourceTree(
+      groups: value.resourceGroups,
+      rootOrder: value.resourceRootOrder,
+      assets: value.assets,
+      folders: value.folders,
+    );
     final groups = [
-      for (final group in value.resourceGroups)
+      for (final group in currentTree.groups)
         _resourceGroupWithout(
           group,
           assetIds: movingAssetIds,
           sourceImageIds: movingSourceIds,
           folderIds: movingFolderIds,
         ),
-    ].where((group) => !group.isEmpty).toList();
+    ];
+    final groupId = _uuid.v4();
+    final selectedNodeKeys = <String>{
+      for (final sourceImageId in nextSourceImageIds)
+        StoryboardResourceNodeRef.source(sourceImageId).key,
+      for (final folderId in nextFolderIds)
+        StoryboardResourceNodeRef.folder(folderId).key,
+    };
+    final childOrder = [
+      for (final key in currentTree.rootOrder)
+        if (selectedNodeKeys.contains(key)) key,
+      for (final key in selectedNodeKeys)
+        if (!currentTree.rootOrder.contains(key)) key,
+    ];
     groups.add(
       StoryboardResourceGroup(
-        id: _uuid.v4(),
+        id: groupId,
         name: groupName,
         assetIds: nextAssetIds,
         sourceImageIds: nextSourceImageIds,
         folderIds: nextFolderIds,
+        childOrder: childOrder,
       ),
     );
+    final rootOrder = [
+      for (final key in currentTree.rootOrder)
+        if (!selectedNodeKeys.contains(key)) key,
+      StoryboardResourceNodeRef.group(groupId).key,
+    ];
+    final nextTree = _normalizeResourceTree(
+      groups: groups,
+      rootOrder: rootOrder,
+      assets: value.assets,
+      folders: value.folders,
+    );
     _setState(
-      value.copyWith(resourceGroups: groups, message: '已创建裁切资源编组 $groupName'),
+      value.copyWith(
+        resourceGroups: nextTree.groups,
+        resourceRootOrder: nextTree.rootOrder,
+        message: '已创建裁切资源编组 $groupName',
+      ),
     );
   }
 
@@ -515,6 +550,160 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         ],
       ),
     );
+  }
+
+  bool renameResourceGroup(String groupId, String name) {
+    if (name.trim().isEmpty) {
+      value = value.copyWith(message: '编组名称不能为空');
+      return false;
+    }
+    final index = value.resourceGroups.indexWhere(
+      (group) => group.id == groupId,
+    );
+    if (index < 0) {
+      return false;
+    }
+    final safeName = _safeFolderName(name);
+    final uniqueName = _uniqueResourceGroupName(
+      safeName,
+      excludingGroupId: groupId,
+    );
+    final previousName = value.resourceGroups[index].name;
+    _setState(
+      value.copyWith(
+        resourceGroups: [
+          for (final group in value.resourceGroups)
+            if (group.id == groupId)
+              group.copyWith(name: uniqueName)
+            else
+              group,
+        ],
+        message: '已将 $previousName 重命名为 $uniqueName',
+      ),
+    );
+    return true;
+  }
+
+  bool moveResourceNode(
+    String nodeKey, {
+    String? targetGroupId,
+    String? beforeNodeKey,
+  }) {
+    final node = StoryboardResourceNodeRef.tryParse(nodeKey);
+    if (node == null) {
+      return false;
+    }
+    final currentTree = _normalizeResourceTree(
+      groups: value.resourceGroups,
+      rootOrder: value.resourceRootOrder,
+      assets: value.assets,
+      folders: value.folders,
+    );
+    if (targetGroupId != null &&
+        !currentTree.groups.any((group) => group.id == targetGroupId)) {
+      return false;
+    }
+    if (!_resourceNodeExists(node, currentTree.groups)) {
+      return false;
+    }
+    if (node.kind == StoryboardResourceNodeKind.group &&
+        targetGroupId != null &&
+        (targetGroupId == node.id ||
+            _isResourceGroupDescendant(
+              targetGroupId,
+              ancestorGroupId: node.id,
+              groups: currentTree.groups,
+            ))) {
+      _setState(
+        value.copyWith(message: '不能把编组移动到自身或其子编组中'),
+        saveWorkspace: false,
+      );
+      return false;
+    }
+
+    var groups = [
+      for (final group in currentTree.groups)
+        group.copyWith(
+          folderIds: node.kind == StoryboardResourceNodeKind.folder
+              ? [
+                  for (final id in group.folderIds)
+                    if (id != node.id) id,
+                ]
+              : group.folderIds,
+          sourceImageIds: node.kind == StoryboardResourceNodeKind.source
+              ? [
+                  for (final id in group.sourceImageIds)
+                    if (id != node.id) id,
+                ]
+              : group.sourceImageIds,
+          childOrder: [
+            for (final key in group.childOrder)
+              if (key != nodeKey) key,
+          ],
+        ),
+    ];
+    var rootOrder = [
+      for (final key in currentTree.rootOrder)
+        if (key != nodeKey) key,
+    ];
+
+    if (node.kind == StoryboardResourceNodeKind.group) {
+      groups = [
+        for (final group in groups)
+          if (group.id == node.id)
+            group.copyWith(parentGroupId: targetGroupId)
+          else
+            group,
+      ];
+    } else if (targetGroupId != null) {
+      groups = [
+        for (final group in groups)
+          if (group.id == targetGroupId)
+            group.copyWith(
+              folderIds: node.kind == StoryboardResourceNodeKind.folder
+                  ? [...group.folderIds, node.id]
+                  : group.folderIds,
+              sourceImageIds: node.kind == StoryboardResourceNodeKind.source
+                  ? [...group.sourceImageIds, node.id]
+                  : group.sourceImageIds,
+            )
+          else
+            group,
+      ];
+    }
+
+    if (targetGroupId == null) {
+      _insertResourceNodeBefore(rootOrder, nodeKey, beforeNodeKey);
+    } else {
+      groups = [
+        for (final group in groups)
+          if (group.id == targetGroupId)
+            group.copyWith(
+              childOrder: _resourceOrderWithInsertedNode(
+                group.childOrder,
+                nodeKey,
+                beforeNodeKey,
+              ),
+            )
+          else
+            group,
+      ];
+    }
+
+    final nextTree = _normalizeResourceTree(
+      groups: groups,
+      rootOrder: rootOrder,
+      assets: value.assets,
+      folders: value.folders,
+    );
+    _setState(
+      value.copyWith(
+        resourceGroups: nextTree.groups,
+        resourceRootOrder: nextTree.rootOrder,
+        message: targetGroupId == null ? '已调整裁切资源顺序' : '已移动到编组中',
+      ),
+    );
+    return true;
   }
 
   Future<void> _reloadAssets({
@@ -604,10 +793,11 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         )
         .toList();
     final folders = _foldersFromScan(scanResult.folders);
-    final resourceGroups = _pruneResourceGroups(
-      value.resourceGroups,
-      assets,
-      folders,
+    final resourceTree = _normalizeResourceTree(
+      groups: value.resourceGroups,
+      rootOrder: value.resourceRootOrder,
+      assets: assets,
+      folders: folders,
     );
     if (evictImageCache) {
       _evictFileImageCache(
@@ -627,7 +817,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       value.copyWith(
         assets: assets,
         folders: folders,
-        resourceGroups: resourceGroups,
+        resourceGroups: resourceTree.groups,
+        resourceRootOrder: resourceTree.rootOrder,
         boards: _removeMissingItemsFromBoards(value.boards, validIds),
         message:
             message ??
@@ -697,16 +888,20 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     _database.deleteCutResultsForImage(imageId);
     final cleanedEmptyDirectories = _cleanEmptyCutDirectories();
     final deletedIds = assets.map((asset) => asset.id).toSet();
+    final nextAssets = value.assets
+        .where((asset) => asset.imageId != imageId)
+        .toList();
+    final resourceTree = _normalizeResourceTree(
+      groups: value.resourceGroups,
+      rootOrder: value.resourceRootOrder,
+      assets: nextAssets,
+      folders: value.folders,
+    );
     _setState(
       value.copyWith(
-        assets: value.assets
-            .where((asset) => asset.imageId != imageId)
-            .toList(),
-        resourceGroups: _pruneResourceGroups(
-          value.resourceGroups,
-          value.assets.where((asset) => asset.imageId != imageId).toList(),
-          value.folders,
-        ),
+        assets: nextAssets,
+        resourceGroups: resourceTree.groups,
+        resourceRootOrder: resourceTree.rootOrder,
         boards: [
           for (final board in value.boards)
             _boardWithAdaptiveHeight(
@@ -2885,35 +3080,256 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     return parts.join('，');
   }
 
-  List<StoryboardResourceGroup> _pruneResourceGroups(
-    List<StoryboardResourceGroup> groups,
-    List<StoryboardCutAsset> assets,
-    List<StoryboardFolder> folders,
-  ) {
+  ({List<StoryboardResourceGroup> groups, List<String> rootOrder})
+  _normalizeResourceTree({
+    required List<StoryboardResourceGroup> groups,
+    required List<String> rootOrder,
+    required List<StoryboardCutAsset> assets,
+    required List<StoryboardFolder> folders,
+  }) {
     final validAssetIds = {
       for (final asset in assets) asset.id,
       for (final folder in folders)
         for (final asset in folder.assets) asset.id,
     };
-    final validSourceImageIds = {for (final asset in assets) asset.imageId};
+    final sourceImageIds = <String>[];
+    final seenSourceImageIds = <String>{};
+    for (final asset in assets) {
+      if (seenSourceImageIds.add(asset.imageId)) {
+        sourceImageIds.add(asset.imageId);
+      }
+    }
+    final validSourceImageIds = sourceImageIds.toSet();
     final validFolderIds = {for (final folder in folders) folder.id};
-    return [
-      for (final group in groups)
+    final seenGroupIds = <String>{};
+    var normalizedGroups = <StoryboardResourceGroup>[];
+    final claimedAssetIds = <String>{};
+    final claimedSourceImageIds = <String>{};
+    final claimedFolderIds = <String>{};
+    for (final group in groups) {
+      if (group.id.trim().isEmpty || !seenGroupIds.add(group.id)) {
+        continue;
+      }
+      normalizedGroups.add(
         group.copyWith(
           assetIds: [
             for (final assetId in group.assetIds)
-              if (validAssetIds.contains(assetId)) assetId,
+              if (validAssetIds.contains(assetId) &&
+                  claimedAssetIds.add(assetId))
+                assetId,
           ],
           sourceImageIds: [
             for (final sourceImageId in group.sourceImageIds)
-              if (validSourceImageIds.contains(sourceImageId)) sourceImageId,
+              if (validSourceImageIds.contains(sourceImageId) &&
+                  claimedSourceImageIds.add(sourceImageId))
+                sourceImageId,
           ],
           folderIds: [
             for (final folderId in group.folderIds)
-              if (validFolderIds.contains(folderId)) folderId,
+              if (validFolderIds.contains(folderId) &&
+                  claimedFolderIds.add(folderId))
+                folderId,
           ],
         ),
-    ].where((group) => !group.isEmpty).toList();
+      );
+    }
+
+    final groupIds = normalizedGroups.map((group) => group.id).toSet();
+    normalizedGroups = [
+      for (final group in normalizedGroups)
+        group.copyWith(
+          parentGroupId:
+              group.parentGroupId != null &&
+                  group.parentGroupId != group.id &&
+                  groupIds.contains(group.parentGroupId)
+              ? group.parentGroupId
+              : null,
+        ),
+    ];
+
+    for (final group in [...normalizedGroups]) {
+      final visited = <String>{group.id};
+      var parentId = group.parentGroupId;
+      var cyclic = false;
+      while (parentId != null) {
+        if (!visited.add(parentId)) {
+          cyclic = true;
+          break;
+        }
+        parentId = normalizedGroups
+            .cast<StoryboardResourceGroup?>()
+            .firstWhere(
+              (candidate) => candidate?.id == parentId,
+              orElse: () => null,
+            )
+            ?.parentGroupId;
+      }
+      if (cyclic) {
+        normalizedGroups = [
+          for (final candidate in normalizedGroups)
+            if (candidate.id == group.id)
+              candidate.copyWith(parentGroupId: null)
+            else
+              candidate,
+        ];
+      }
+    }
+
+    while (true) {
+      final groupsWithChildren = {
+        for (final group in normalizedGroups)
+          if (group.parentGroupId != null) group.parentGroupId!,
+      };
+      final removableIds = {
+        for (final group in normalizedGroups)
+          if (group.isEmpty && !groupsWithChildren.contains(group.id)) group.id,
+      };
+      if (removableIds.isEmpty) {
+        break;
+      }
+      normalizedGroups = [
+        for (final group in normalizedGroups)
+          if (!removableIds.contains(group.id)) group,
+      ];
+    }
+
+    final retainedGroupIds = normalizedGroups.map((group) => group.id).toSet();
+    normalizedGroups = [
+      for (final group in normalizedGroups)
+        group.copyWith(
+          parentGroupId: retainedGroupIds.contains(group.parentGroupId)
+              ? group.parentGroupId
+              : null,
+        ),
+    ];
+    final childGroupIdsByParent = <String, List<String>>{};
+    for (final group in normalizedGroups) {
+      final parentId = group.parentGroupId;
+      if (parentId != null) {
+        childGroupIdsByParent.putIfAbsent(parentId, () => []).add(group.id);
+      }
+    }
+    normalizedGroups = [
+      for (final group in normalizedGroups)
+        group.copyWith(
+          childOrder: _normalizedResourceOrder(group.childOrder, [
+            for (final groupId in childGroupIdsByParent[group.id] ?? const [])
+              StoryboardResourceNodeRef.group(groupId).key,
+            for (final folderId in group.folderIds)
+              StoryboardResourceNodeRef.folder(folderId).key,
+            for (final sourceImageId in group.sourceImageIds)
+              StoryboardResourceNodeRef.source(sourceImageId).key,
+          ]),
+        ),
+    ];
+
+    final retainedClaimedAssetIds = {
+      for (final group in normalizedGroups) ...group.assetIds,
+    };
+    final retainedClaimedSourceIds = {
+      for (final group in normalizedGroups) ...group.sourceImageIds,
+    };
+    final retainedClaimedFolderIds = {
+      for (final group in normalizedGroups) ...group.folderIds,
+    };
+    final rootKeys = <String>[
+      for (final group in normalizedGroups)
+        if (group.parentGroupId == null)
+          StoryboardResourceNodeRef.group(group.id).key,
+      for (final folder in folders)
+        if (!retainedClaimedFolderIds.contains(folder.id))
+          StoryboardResourceNodeRef.folder(folder.id).key,
+      for (final sourceImageId in sourceImageIds)
+        if (!retainedClaimedSourceIds.contains(sourceImageId) &&
+            assets.any(
+              (asset) =>
+                  asset.imageId == sourceImageId &&
+                  !retainedClaimedAssetIds.contains(asset.id),
+            ))
+          StoryboardResourceNodeRef.source(sourceImageId).key,
+    ];
+    return (
+      groups: normalizedGroups,
+      rootOrder: _normalizedResourceOrder(rootOrder, rootKeys),
+    );
+  }
+
+  List<String> _normalizedResourceOrder(
+    Iterable<String> preferred,
+    Iterable<String> valid,
+  ) {
+    final validKeys = valid.toSet();
+    final result = <String>[];
+    final seen = <String>{};
+    for (final key in preferred) {
+      if (validKeys.contains(key) && seen.add(key)) {
+        result.add(key);
+      }
+    }
+    for (final key in valid) {
+      if (seen.add(key)) {
+        result.add(key);
+      }
+    }
+    return result;
+  }
+
+  bool _resourceNodeExists(
+    StoryboardResourceNodeRef node,
+    List<StoryboardResourceGroup> groups,
+  ) {
+    return switch (node.kind) {
+      StoryboardResourceNodeKind.group => groups.any(
+        (group) => group.id == node.id,
+      ),
+      StoryboardResourceNodeKind.folder => value.folders.any(
+        (folder) => folder.id == node.id,
+      ),
+      StoryboardResourceNodeKind.source => value.assets.any(
+        (asset) => asset.imageId == node.id,
+      ),
+    };
+  }
+
+  bool _isResourceGroupDescendant(
+    String groupId, {
+    required String ancestorGroupId,
+    required List<StoryboardResourceGroup> groups,
+  }) {
+    final groupsById = {for (final group in groups) group.id: group};
+    var currentId = groupId;
+    final visited = <String>{};
+    while (visited.add(currentId)) {
+      final parentId = groupsById[currentId]?.parentGroupId;
+      if (parentId == null) {
+        return false;
+      }
+      if (parentId == ancestorGroupId) {
+        return true;
+      }
+      currentId = parentId;
+    }
+    return true;
+  }
+
+  void _insertResourceNodeBefore(
+    List<String> values,
+    String value,
+    String? beforeValue,
+  ) {
+    values.remove(value);
+    final index = beforeValue == null ? -1 : values.indexOf(beforeValue);
+    values.insert(index < 0 ? values.length : index, value);
+  }
+
+  List<String> _resourceOrderWithInsertedNode(
+    List<String> values,
+    String value,
+    String? beforeValue,
+  ) {
+    final result = [...values];
+    _insertResourceNodeBefore(result, value, beforeValue);
+    return result;
   }
 
   StoryboardResourceGroup _resourceGroupWithout(
@@ -2935,11 +3351,20 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         for (final folderId in group.folderIds)
           if (!folderIds.contains(folderId)) folderId,
       ],
+      childOrder: [
+        for (final key in group.childOrder)
+          if (!sourceImageIds.contains(
+                StoryboardResourceNodeRef.tryParse(key)?.id,
+              ) &&
+              !folderIds.contains(StoryboardResourceNodeRef.tryParse(key)?.id))
+            key,
+      ],
     );
   }
 
-  String _uniqueResourceGroupName(String name) {
+  String _uniqueResourceGroupName(String name, {String? excludingGroupId}) {
     final existingNames = value.resourceGroups
+        .where((group) => group.id != excludingGroupId)
         .map((group) => group.name)
         .toSet();
     var candidate = name;
@@ -3721,6 +4146,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         assets: value.assets,
         folders: value.folders,
         resourceGroups: _resourceGroupsFromJson(decoded['resourceGroups']),
+        resourceRootOrder: _jsonStringList(decoded['resourceRootOrder']),
         boards: normalizedBoards.map(_boardWithAdaptiveHeight).toList(),
         boardGroups: boardGroups,
         openBoardIds: openBoardIds,
@@ -3747,6 +4173,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       'resourceGroups': [
         for (final group in state.resourceGroups) _resourceGroupToJson(group),
       ],
+      'resourceRootOrder': state.resourceRootOrder,
       'boards': [
         for (final board in state.boards)
           _boardToJson(_compactBoardItems(board)),
@@ -3761,6 +4188,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       'assetIds': group.assetIds,
       'sourceImageIds': group.sourceImageIds,
       'folderIds': group.folderIds,
+      'parentGroupId': group.parentGroupId,
+      'childOrder': group.childOrder,
       'expanded': group.expanded,
     };
   }
@@ -3930,11 +4359,11 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         assetIds: _jsonStringList(item['assetIds']),
         sourceImageIds: _jsonStringList(item['sourceImageIds']),
         folderIds: _jsonStringList(item['folderIds']),
+        parentGroupId: _jsonNullableString(item['parentGroupId']),
+        childOrder: _jsonStringList(item['childOrder']),
         expanded: _jsonBool(item['expanded'], true),
       );
-      if (!group.isEmpty) {
-        groups.add(group);
-      }
+      groups.add(group);
     }
     return groups;
   }

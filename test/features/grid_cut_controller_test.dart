@@ -7,6 +7,7 @@ import 'package:storyboard_grid_app/core/services/app_directories.dart';
 import 'package:storyboard_grid_app/features/grid_cut/application/grid_cut_controller.dart';
 import 'package:storyboard_grid_app/features/grid_cut/data/grid_crop_service.dart';
 import 'package:storyboard_grid_app/features/grid_cut/data/grid_detection_service.dart';
+import 'package:storyboard_grid_app/features/grid_cut/domain/grid_cut_models.dart';
 import 'package:storyboard_grid_app/features/settings/application/settings_controller.dart';
 import 'package:storyboard_grid_app/features/settings/data/settings_repository.dart';
 import 'package:test/test.dart';
@@ -235,6 +236,61 @@ void main() {
     expect(restored.value.taskGroups.first.imageIds, [ids[0]]);
     expect(restored.value.taskGroups.last.imageIds, [ids[2]]);
     expect(restored.value.taskGroups.last.expanded, isFalse);
+  });
+
+  test('图片任务支持跨层拖拽重排并持久化统一顺序', () async {
+    final fixture = await _createFixture();
+    final paths = await _createImages(fixture.root, 4);
+    await fixture.controller.importPaths(paths);
+    final ids = fixture.controller.value.images
+        .map((image) => image.id)
+        .toList();
+
+    fixture.controller.groupImageTasks('镜头组', [ids[0], ids[1]]);
+    final group = fixture.controller.value.taskGroups.single;
+    final groupKey = GridCutTaskNodeRef.group(group.id).key;
+    final fourthKey = GridCutTaskNodeRef.image(ids[3]).key;
+
+    expect(
+      fixture.controller.moveTaskNode(fourthKey, beforeNodeKey: groupKey),
+      isTrue,
+    );
+    expect(fixture.controller.value.taskOrder.first, fourthKey);
+
+    expect(
+      fixture.controller.moveTaskNode(
+        GridCutTaskNodeRef.image(ids[2]).key,
+        targetGroupId: group.id,
+        beforeNodeKey: GridCutTaskNodeRef.image(ids[0]).key,
+      ),
+      isTrue,
+    );
+    expect(fixture.controller.value.taskGroups.single.imageIds, [
+      ids[2],
+      ids[0],
+      ids[1],
+    ]);
+    expect(fixture.controller.value.images.map((image) => image.id), [
+      ids[3],
+      ids[2],
+      ids[0],
+      ids[1],
+    ]);
+
+    fixture.controller.flushWorkspaceSnapshot();
+    final restored = GridCutController(
+      directories: await AppDirectories.create(
+        executableDirectory: fixture.root,
+      ),
+      database: fixture.database,
+      settingsController: fixture.settingsController,
+      detectionService: const GridDetectionService(),
+      cropService: const GridCropService(),
+    );
+    addTearDown(restored.dispose);
+
+    expect(restored.value.taskOrder, fixture.controller.value.taskOrder);
+    expect(restored.value.taskGroups.single.imageIds, [ids[2], ids[0], ids[1]]);
   });
 
   test('恢复时会移除已丢失的裁切任务图片并保存清理结果', () async {

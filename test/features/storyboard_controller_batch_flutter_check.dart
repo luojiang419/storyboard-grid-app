@@ -841,6 +841,99 @@ void main() {
     expect(group.folderIds, [folder.id]);
   });
 
+  test('裁切资源编组支持多级嵌套重排重命名并阻止循环', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'storyboard_resource_tree_',
+    );
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await controller.createFolder('文件夹一');
+    await controller.createFolder('文件夹二');
+    final folders = controller.value.folders;
+    await controller.createResourceGroup(
+      name: '父编组',
+      folderIds: [folders[0].id],
+    );
+    await controller.createResourceGroup(
+      name: '子编组',
+      folderIds: [folders[1].id],
+    );
+    final parentId = controller.value.resourceGroups.first.id;
+    final childId = controller.value.resourceGroups.last.id;
+
+    expect(
+      controller.moveResourceNode(
+        StoryboardResourceNodeRef.group(childId).key,
+        targetGroupId: parentId,
+      ),
+      isTrue,
+    );
+    expect(
+      controller.value.resourceGroups
+          .firstWhere((group) => group.id == childId)
+          .parentGroupId,
+      parentId,
+    );
+
+    expect(
+      controller.moveResourceNode(
+        StoryboardResourceNodeRef.folder(folders[0].id).key,
+        targetGroupId: childId,
+        beforeNodeKey: StoryboardResourceNodeRef.folder(folders[1].id).key,
+      ),
+      isTrue,
+    );
+    final child = controller.value.resourceGroups.firstWhere(
+      (group) => group.id == childId,
+    );
+    expect(child.folderIds, [folders[1].id, folders[0].id]);
+    expect(child.childOrder, [
+      StoryboardResourceNodeRef.folder(folders[0].id).key,
+      StoryboardResourceNodeRef.folder(folders[1].id).key,
+    ]);
+
+    expect(
+      controller.moveResourceNode(
+        StoryboardResourceNodeRef.group(parentId).key,
+        targetGroupId: childId,
+      ),
+      isFalse,
+    );
+    expect(controller.value.message, '不能把编组移动到自身或其子编组中');
+
+    expect(controller.renameResourceGroup(childId, '父编组'), isTrue);
+    expect(
+      controller.value.resourceGroups
+          .firstWhere((group) => group.id == childId)
+          .name,
+      '父编组 2',
+    );
+
+    controller.flushWorkspaceSnapshot();
+    final restored = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(restored.dispose);
+    await restored.refreshAssets();
+    final restoredChild = restored.value.resourceGroups.firstWhere(
+      (group) => group.id == childId,
+    );
+    expect(restoredChild.parentGroupId, parentId);
+    expect(restoredChild.name, '父编组 2');
+    expect(restoredChild.childOrder, child.childOrder);
+  });
+
   test('自动解析会逐图入库并按逐行模式回填文本', () async {
     final root = await Directory.systemTemp.createTemp('storyboard_vision_');
     final directories = await AppDirectories.create(executableDirectory: root);

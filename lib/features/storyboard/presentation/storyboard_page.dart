@@ -43,6 +43,8 @@ enum _ResourceContextAction { toggleUse, createGroup }
 
 enum _FolderContextAction { openDirectory }
 
+enum _ResourceGroupContextAction { rename }
+
 StoryboardState _storyboardState(StoryboardState state) => state;
 
 bool _sameBoardBarState(StoryboardState previous, StoryboardState next) {
@@ -69,6 +71,7 @@ bool _sameAssetSidebarState(StoryboardState previous, StoryboardState next) {
   return identical(previous.assets, next.assets) &&
       identical(previous.folders, next.folders) &&
       identical(previous.resourceGroups, next.resourceGroups) &&
+      listEquals(previous.resourceRootOrder, next.resourceRootOrder) &&
       previous.selectedBoardId == next.selectedBoardId &&
       _sameUsedAssetIds(previous.selectedBoard, next.selectedBoard);
 }
@@ -214,6 +217,9 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
                                     ),
                                 onToggleResourceGroupExpanded:
                                     controller.toggleResourceGroupExpanded,
+                                onMoveResourceNode: controller.moveResourceNode,
+                                onRenameResourceGroup:
+                                    controller.renameResourceGroup,
                                 onCollapse: () =>
                                     _setAssetSidebarExpanded(false),
                               ),
@@ -680,6 +686,8 @@ class _AssetSidebar extends ConsumerStatefulWidget {
     required this.onCopyPathsToFolder,
     required this.onCreateResourceGroup,
     required this.onToggleResourceGroupExpanded,
+    required this.onMoveResourceNode,
+    required this.onRenameResourceGroup,
     required this.onCollapse,
   });
 
@@ -705,6 +713,13 @@ class _AssetSidebar extends ConsumerStatefulWidget {
   })
   onCreateResourceGroup;
   final ValueChanged<String> onToggleResourceGroupExpanded;
+  final bool Function(
+    String nodeKey, {
+    String? targetGroupId,
+    String? beforeNodeKey,
+  })
+  onMoveResourceNode;
+  final bool Function(String groupId, String name) onRenameResourceGroup;
   final VoidCallback onCollapse;
 
   @override
@@ -841,6 +856,17 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
       resourceGroups: widget.state.resourceGroups,
     );
     final previewIds = _previewAssetIds(visibleAssets);
+    final rootNodeKeys = _rootResourceNodeKeys(
+      ungroupedFolders: ungroupedFolders,
+      ungroupedSourceIds: groups.keys,
+    );
+    final resourceNodes = _buildResourceNodes(
+      nodeKeys: rootNodeKeys,
+      sequencePrefix: '',
+      parentGroupId: null,
+      usedIds: widget.state.usedAssetIds,
+      previewIds: previewIds,
+    );
     final hasResources =
         groups.isNotEmpty ||
         ungroupedFolders.isNotEmpty ||
@@ -907,94 +933,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
                       onFolderCheckedChanged: _setGroupFolderChecked,
                       child: ListView(
                         padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
-                        children: [
-                          for (final group in widget.state.resourceGroups)
-                            _ResourceGroupSection(
-                              group: group,
-                              assets: _assetsForResourceGroup(group),
-                              folders: _foldersForResourceGroup(group),
-                              usedIds: widget.state.usedAssetIds,
-                              previewIds: previewIds,
-                              previewAdding: _rangeAdding,
-                              thumbnailSize: _thumbSize,
-                              expandedFolderIds: _expandedFolders,
-                              onToggleExpanded: () => widget
-                                  .onToggleResourceGroupExpanded(group.id),
-                              onToggleFolderExpanded: _toggleFolderExpanded,
-                              onToggleAsset: _toggleAsset,
-                              onRemoveAsset: _removeAsset,
-                              onRangeHover: _updateRangeTarget,
-                              onDeleteFolderAsset: (asset) =>
-                                  unawaited(widget.onDeleteFolderAsset(asset)),
-                              onOpenFolderDirectory:
-                                  widget.onOpenFolderDirectory,
-                              onCreateAssetResourceGroup: (_) =>
-                                  unawaited(_createCheckedResourceGroup()),
-                              onDropAsset: (asset, folderId) =>
-                                  widget.onCopyAssetToFolder(asset, folderId),
-                              onDropPaths: (paths, folderId) =>
-                                  widget.onCopyPathsToFolder(paths, folderId),
-                            ),
-                          if (widget.state.resourceGroups.isNotEmpty &&
-                              (ungroupedFolders.isNotEmpty ||
-                                  groups.isNotEmpty))
-                            Divider(
-                              height: 20,
-                              color: scheme.outlineVariant.withValues(
-                                alpha: 0.42,
-                              ),
-                            ),
-                          for (final folder in ungroupedFolders)
-                            _AssetFolderGroup(
-                              folder: folder,
-                              expanded: _expandedFolders.contains(folder.id),
-                              usedIds: widget.state.usedAssetIds,
-                              previewIds: previewIds,
-                              previewAdding: _rangeAdding,
-                              thumbnailSize: _thumbSize,
-                              onToggleExpanded: () =>
-                                  _toggleFolderExpanded(folder.id),
-                              onToggleAsset: _toggleAsset,
-                              onRemoveAsset: _removeAsset,
-                              onDeleteAsset: (asset) =>
-                                  unawaited(widget.onDeleteFolderAsset(asset)),
-                              onOpenDirectory: () =>
-                                  widget.onOpenFolderDirectory(folder),
-                              onRangeHover: _updateRangeTarget,
-                              onCreateAssetResourceGroup: (_) =>
-                                  unawaited(_createCheckedResourceGroup()),
-                              onDropAsset: (asset) =>
-                                  widget.onCopyAssetToFolder(asset, folder.id),
-                              onDropPaths: (paths) =>
-                                  widget.onCopyPathsToFolder(paths, folder.id),
-                            ),
-                          if (ungroupedFolders.isNotEmpty && groups.isNotEmpty)
-                            Divider(
-                              height: 20,
-                              color: scheme.outlineVariant.withValues(
-                                alpha: 0.42,
-                              ),
-                            ),
-                          for (final entry in groups.entries)
-                            _AssetGroup(
-                              title: entry.value.first.sourceName,
-                              assets: entry.value,
-                              expanded: _expandedSources.contains(entry.key),
-                              usedIds: widget.state.usedAssetIds,
-                              previewIds: previewIds,
-                              previewAdding: _rangeAdding,
-                              thumbnailSize: _thumbSize,
-                              onToggleExpanded: () =>
-                                  _toggleExpanded(entry.key),
-                              onToggleAsset: _toggleAsset,
-                              onRemoveAsset: _removeAsset,
-                              onRangeHover: _updateRangeTarget,
-                              onCreateAssetResourceGroup: (_) =>
-                                  unawaited(_createCheckedResourceGroup()),
-                              onDeleteGroup: () =>
-                                  widget.onDeleteGroup(entry.key),
-                            ),
-                        ],
+                        children: resourceNodes,
                       ),
                     ),
             ),
@@ -1266,6 +1205,274 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     ];
   }
 
+  List<StoryboardCutAsset> _directAssetsForResourceGroup(
+    StoryboardResourceGroup group,
+  ) {
+    final assetIds = group.assetIds.toSet();
+    return [
+      for (final asset in widget.state.assets)
+        if (assetIds.contains(asset.id)) asset,
+      for (final folder in widget.state.folders)
+        for (final asset in folder.assets)
+          if (assetIds.contains(asset.id)) asset,
+    ];
+  }
+
+  List<String> _rootResourceNodeKeys({
+    required List<StoryboardFolder> ungroupedFolders,
+    required Iterable<String> ungroupedSourceIds,
+  }) {
+    final validKeys = <String>[
+      for (final group in widget.state.resourceGroups)
+        if (group.parentGroupId == null)
+          StoryboardResourceNodeRef.group(group.id).key,
+      for (final folder in ungroupedFolders)
+        StoryboardResourceNodeRef.folder(folder.id).key,
+      for (final sourceId in ungroupedSourceIds)
+        StoryboardResourceNodeRef.source(sourceId).key,
+    ];
+    return _orderedResourceNodeKeys(widget.state.resourceRootOrder, validKeys);
+  }
+
+  List<String> _childResourceNodeKeys(StoryboardResourceGroup group) {
+    final validKeys = <String>[
+      for (final childGroup in widget.state.resourceGroups)
+        if (childGroup.parentGroupId == group.id)
+          StoryboardResourceNodeRef.group(childGroup.id).key,
+      for (final folderId in group.folderIds)
+        StoryboardResourceNodeRef.folder(folderId).key,
+      for (final sourceImageId in group.sourceImageIds)
+        StoryboardResourceNodeRef.source(sourceImageId).key,
+    ];
+    return _orderedResourceNodeKeys(group.childOrder, validKeys);
+  }
+
+  List<String> _orderedResourceNodeKeys(
+    Iterable<String> preferred,
+    Iterable<String> valid,
+  ) {
+    final validSet = valid.toSet();
+    final result = <String>[];
+    final seen = <String>{};
+    for (final key in preferred) {
+      if (validSet.contains(key) && seen.add(key)) {
+        result.add(key);
+      }
+    }
+    for (final key in valid) {
+      if (seen.add(key)) {
+        result.add(key);
+      }
+    }
+    return result;
+  }
+
+  List<Widget> _buildResourceNodes({
+    required List<String> nodeKeys,
+    required String sequencePrefix,
+    required String? parentGroupId,
+    required Set<String> usedIds,
+    required Set<String> previewIds,
+  }) {
+    final widgets = <Widget>[];
+    for (var index = 0; index < nodeKeys.length; index++) {
+      final node = StoryboardResourceNodeRef.tryParse(nodeKeys[index]);
+      if (node == null) {
+        continue;
+      }
+      final sequence = sequencePrefix.isEmpty
+          ? '${index + 1}'
+          : '$sequencePrefix.${index + 1}';
+      switch (node.kind) {
+        case StoryboardResourceNodeKind.group:
+          final group = widget.state.resourceGroups
+              .cast<StoryboardResourceGroup?>()
+              .firstWhere(
+                (candidate) => candidate?.id == node.id,
+                orElse: () => null,
+              );
+          if (group == null) {
+            continue;
+          }
+          final childKeys = _childResourceNodeKeys(group);
+          widgets.add(
+            _ResourceGroupSection(
+              group: group,
+              sequence: sequence,
+              parentGroupId: parentGroupId,
+              siblingKeys: nodeKeys,
+              headerAssets: _assetsForResourceGroup(group),
+              headerFolders: _foldersForResourceGroup(group),
+              childGroupCount: childKeys
+                  .map(StoryboardResourceNodeRef.tryParse)
+                  .where(
+                    (child) => child?.kind == StoryboardResourceNodeKind.group,
+                  )
+                  .length,
+              directAssets: _directAssetsForResourceGroup(group),
+              childNodes: _buildResourceNodes(
+                nodeKeys: childKeys,
+                sequencePrefix: sequence,
+                parentGroupId: group.id,
+                usedIds: usedIds,
+                previewIds: previewIds,
+              ),
+              usedIds: usedIds,
+              previewIds: previewIds,
+              previewAdding: _rangeAdding,
+              thumbnailSize: _thumbSize,
+              onToggleExpanded: () =>
+                  widget.onToggleResourceGroupExpanded(group.id),
+              onToggleAsset: _toggleAsset,
+              onRemoveAsset: _removeAsset,
+              onRangeHover: _updateRangeTarget,
+              onCreateAssetResourceGroup: (_) =>
+                  unawaited(_createCheckedResourceGroup()),
+              onMoveNode: _moveDroppedResource,
+              onRename: () => unawaited(_renameResourceGroup(group)),
+            ),
+          );
+          break;
+        case StoryboardResourceNodeKind.folder:
+          final folder = widget.state.folders
+              .cast<StoryboardFolder?>()
+              .firstWhere(
+                (candidate) => candidate?.id == node.id,
+                orElse: () => null,
+              );
+          if (folder == null) {
+            continue;
+          }
+          widgets.add(
+            _AssetFolderGroup(
+              folder: folder,
+              sequence: sequence,
+              parentGroupId: parentGroupId,
+              siblingKeys: nodeKeys,
+              expanded: _expandedFolders.contains(folder.id),
+              usedIds: usedIds,
+              previewIds: previewIds,
+              previewAdding: _rangeAdding,
+              thumbnailSize: _thumbSize,
+              onToggleExpanded: () => _toggleFolderExpanded(folder.id),
+              onToggleAsset: _toggleAsset,
+              onRemoveAsset: _removeAsset,
+              onDeleteAsset: (asset) =>
+                  unawaited(widget.onDeleteFolderAsset(asset)),
+              onOpenDirectory: () => widget.onOpenFolderDirectory(folder),
+              onRangeHover: _updateRangeTarget,
+              onCreateAssetResourceGroup: (_) =>
+                  unawaited(_createCheckedResourceGroup()),
+              onDropAsset: (asset) =>
+                  widget.onCopyAssetToFolder(asset, folder.id),
+              onDropPaths: (paths) =>
+                  widget.onCopyPathsToFolder(paths, folder.id),
+              onMoveNode: _moveDroppedResource,
+            ),
+          );
+          break;
+        case StoryboardResourceNodeKind.source:
+          final directAssetIds = {
+            for (final group in widget.state.resourceGroups) ...group.assetIds,
+          };
+          final assets = [
+            for (final asset in widget.state.assets)
+              if (asset.imageId == node.id &&
+                  !directAssetIds.contains(asset.id))
+                asset,
+          ];
+          if (assets.isEmpty) {
+            continue;
+          }
+          widgets.add(
+            _AssetGroup(
+              sequence: sequence,
+              parentGroupId: parentGroupId,
+              siblingKeys: nodeKeys,
+              title: assets.first.sourceName,
+              assets: assets,
+              expanded: _expandedSources.contains(node.id),
+              usedIds: usedIds,
+              previewIds: previewIds,
+              previewAdding: _rangeAdding,
+              thumbnailSize: _thumbSize,
+              onToggleExpanded: () => _toggleExpanded(node.id),
+              onToggleAsset: _toggleAsset,
+              onRemoveAsset: _removeAsset,
+              onRangeHover: _updateRangeTarget,
+              onCreateAssetResourceGroup: (_) =>
+                  unawaited(_createCheckedResourceGroup()),
+              onDeleteGroup: () => widget.onDeleteGroup(node.id),
+              onMoveNode: _moveDroppedResource,
+            ),
+          );
+          break;
+      }
+    }
+    return widgets;
+  }
+
+  void _moveDroppedResource(
+    _ResourceNodeDragData data,
+    _ResourceNodeDragData target,
+    String? targetParentGroupId,
+    List<String> siblingKeys,
+    _ResourceDropPlacement placement,
+  ) {
+    if (data.nodeKey == target.nodeKey) {
+      return;
+    }
+    if (placement == _ResourceDropPlacement.inside) {
+      widget.onMoveResourceNode(data.nodeKey, targetGroupId: target.id);
+      return;
+    }
+    String? beforeNodeKey;
+    if (placement == _ResourceDropPlacement.before) {
+      beforeNodeKey = target.nodeKey;
+    } else {
+      final targetIndex = siblingKeys.indexOf(target.nodeKey);
+      if (targetIndex >= 0 && targetIndex + 1 < siblingKeys.length) {
+        beforeNodeKey = siblingKeys[targetIndex + 1];
+      }
+    }
+    widget.onMoveResourceNode(
+      data.nodeKey,
+      targetGroupId: targetParentGroupId,
+      beforeNodeKey: beforeNodeKey,
+    );
+  }
+
+  Future<void> _renameResourceGroup(StoryboardResourceGroup group) async {
+    var name = group.name;
+    final nextName = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('重命名编组文件夹'),
+        content: TextFormField(
+          initialValue: group.name,
+          autofocus: true,
+          decoration: const InputDecoration(labelText: '编组名称'),
+          onChanged: (value) => name = value,
+          onFieldSubmitted: (value) => Navigator.of(context).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(name),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || nextName == null) {
+      return;
+    }
+    widget.onRenameResourceGroup(group.id, nextName);
+  }
+
   void _toggleExpanded(String source) {
     setState(() {
       if (!_expandedSources.remove(source)) {
@@ -1429,18 +1636,65 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     List<StoryboardFolder> folders, {
     List<StoryboardResourceGroup> resourceGroups = const [],
   }) {
-    return [
-      for (final group in resourceGroups)
-        if (group.expanded) ...[
-          ..._assetsForResourceGroup(group),
-          for (final folder in _foldersForResourceGroup(group))
-            if (_expandedFolders.contains(folder.id)) ...folder.assets,
-        ],
-      for (final folder in folders)
-        if (_expandedFolders.contains(folder.id)) ...folder.assets,
-      for (final entry in groups.entries)
-        if (_expandedSources.contains(entry.key)) ...entry.value,
-    ];
+    final groupsById = {for (final group in resourceGroups) group.id: group};
+    final foldersById = {
+      for (final folder in widget.state.folders) folder.id: folder,
+    };
+    final directAssetIds = {
+      for (final group in resourceGroups) ...group.assetIds,
+    };
+    final result = <StoryboardCutAsset>[];
+    final seenAssetIds = <String>{};
+    void addAssets(Iterable<StoryboardCutAsset> assets) {
+      for (final asset in assets) {
+        if (seenAssetIds.add(asset.id)) {
+          result.add(asset);
+        }
+      }
+    }
+
+    void visitNodes(List<String> nodeKeys) {
+      for (final key in nodeKeys) {
+        final node = StoryboardResourceNodeRef.tryParse(key);
+        if (node == null) {
+          continue;
+        }
+        switch (node.kind) {
+          case StoryboardResourceNodeKind.group:
+            final group = groupsById[node.id];
+            if (group != null && group.expanded) {
+              addAssets(_directAssetsForResourceGroup(group));
+              visitNodes(_childResourceNodeKeys(group));
+            }
+            break;
+          case StoryboardResourceNodeKind.folder:
+            final folder = foldersById[node.id];
+            if (folder != null && _expandedFolders.contains(folder.id)) {
+              addAssets(folder.assets);
+            }
+            break;
+          case StoryboardResourceNodeKind.source:
+            if (_expandedSources.contains(node.id)) {
+              addAssets(
+                widget.state.assets.where(
+                  (asset) =>
+                      asset.imageId == node.id &&
+                      !directAssetIds.contains(asset.id),
+                ),
+              );
+            }
+            break;
+        }
+      }
+    }
+
+    visitNodes(
+      _rootResourceNodeKeys(
+        ungroupedFolders: folders,
+        ungroupedSourceIds: groups.keys,
+      ),
+    );
+    return result;
   }
 
   Set<String> _previewAssetIds(List<StoryboardCutAsset> visibleAssets) {
@@ -1589,63 +1843,345 @@ class _CompactHeaderButton extends StatelessWidget {
   }
 }
 
+enum _ResourceDropPlacement { before, inside, after }
+
+typedef _ResourceNodeDropCallback =
+    void Function(
+      _ResourceNodeDragData data,
+      _ResourceNodeDragData target,
+      String? targetParentGroupId,
+      List<String> siblingKeys,
+      _ResourceDropPlacement placement,
+    );
+
+class _ResourceNodeDragData {
+  const _ResourceNodeDragData({
+    required this.kind,
+    required this.id,
+    required this.label,
+  });
+
+  factory _ResourceNodeDragData.group(StoryboardResourceGroup group) {
+    return _ResourceNodeDragData(
+      kind: StoryboardResourceNodeKind.group,
+      id: group.id,
+      label: group.name,
+    );
+  }
+
+  factory _ResourceNodeDragData.folder(StoryboardFolder folder) {
+    return _ResourceNodeDragData(
+      kind: StoryboardResourceNodeKind.folder,
+      id: folder.id,
+      label: folder.name,
+    );
+  }
+
+  factory _ResourceNodeDragData.source(String id, String label) {
+    return _ResourceNodeDragData(
+      kind: StoryboardResourceNodeKind.source,
+      id: id,
+      label: label,
+    );
+  }
+
+  final StoryboardResourceNodeKind kind;
+  final String id;
+  final String label;
+
+  String get nodeKey => StoryboardResourceNodeRef(kind: kind, id: id).key;
+}
+
+class _ResourceNodeDraggable extends StatelessWidget {
+  const _ResourceNodeDraggable({required this.data, required this.child});
+
+  final _ResourceNodeDragData data;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Draggable<_ResourceNodeDragData>(
+      key: ValueKey('resource-node-draggable-${data.nodeKey}'),
+      data: data,
+      maxSimultaneousDrags: 1,
+      rootOverlay: true,
+      dragAnchorStrategy: pointerDragAnchorStrategy,
+      feedback: _ResourceNodeDragFeedback(data: data),
+      childWhenDragging: Opacity(opacity: 0.48, child: child),
+      child: MouseRegion(cursor: SystemMouseCursors.grab, child: child),
+    );
+  }
+}
+
+class _ResourceNodeDragFeedback extends StatelessWidget {
+  const _ResourceNodeDragFeedback({required this.data});
+
+  final _ResourceNodeDragData data;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.82),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.3)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              data.kind == StoryboardResourceNodeKind.source
+                  ? Icons.image_rounded
+                  : Icons.folder_rounded,
+              size: 18,
+              color: Colors.white,
+            ),
+            const SizedBox(width: 8),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 180),
+              child: Text(
+                data.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ResourceNodeDropTarget extends StatefulWidget {
+  const _ResourceNodeDropTarget({
+    required this.target,
+    required this.parentGroupId,
+    required this.siblingKeys,
+    required this.onDrop,
+    required this.child,
+  });
+
+  final _ResourceNodeDragData target;
+  final String? parentGroupId;
+  final List<String> siblingKeys;
+  final _ResourceNodeDropCallback onDrop;
+  final Widget child;
+
+  @override
+  State<_ResourceNodeDropTarget> createState() =>
+      _ResourceNodeDropTargetState();
+}
+
+class _ResourceNodeDropTargetState extends State<_ResourceNodeDropTarget> {
+  _ResourceDropPlacement _placement = _ResourceDropPlacement.before;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return DragTarget<_ResourceNodeDragData>(
+      key: ValueKey('resource-node-drop-${widget.target.nodeKey}'),
+      onWillAcceptWithDetails: (details) =>
+          details.data.nodeKey != widget.target.nodeKey,
+      onMove: (details) => _updatePlacement(details.data, details.offset),
+      onLeave: (_) {
+        if (mounted) {
+          setState(() => _placement = _ResourceDropPlacement.before);
+        }
+      },
+      onAcceptWithDetails: (details) {
+        _updatePlacement(details.data, details.offset, rebuild: false);
+        widget.onDrop(
+          details.data,
+          widget.target,
+          widget.parentGroupId,
+          widget.siblingKeys,
+          _placement,
+        );
+      },
+      builder: (context, candidates, _) {
+        final highlighted = candidates.isNotEmpty;
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            widget.child,
+            if (highlighted)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(8),
+                      border: _placement == _ResourceDropPlacement.inside
+                          ? Border.all(color: scheme.primary, width: 2)
+                          : null,
+                    ),
+                  ),
+                ),
+              ),
+            if (highlighted && _placement != _ResourceDropPlacement.inside)
+              Positioned(
+                left: 2,
+                right: 2,
+                top: _placement == _ResourceDropPlacement.before ? -2 : null,
+                bottom: _placement == _ResourceDropPlacement.after ? -2 : null,
+                child: IgnorePointer(
+                  child: Container(
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: scheme.primary,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _updatePlacement(
+    _ResourceNodeDragData data,
+    Offset globalOffset, {
+    bool rebuild = true,
+  }) {
+    final renderBox = context.findRenderObject();
+    if (renderBox is! RenderBox || !renderBox.hasSize) {
+      return;
+    }
+    final local = renderBox.globalToLocal(globalOffset);
+    final ratio = (local.dy / renderBox.size.height).clamp(0.0, 1.0);
+    final next =
+        widget.target.kind == StoryboardResourceNodeKind.group &&
+            ratio >= 0.25 &&
+            ratio <= 0.75
+        ? _ResourceDropPlacement.inside
+        : ratio < 0.5
+        ? _ResourceDropPlacement.before
+        : _ResourceDropPlacement.after;
+    if (next == _placement) {
+      return;
+    }
+    if (rebuild && mounted) {
+      setState(() => _placement = next);
+    } else {
+      _placement = next;
+    }
+  }
+}
+
+class _ResourceSequenceBadge extends StatelessWidget {
+  const _ResourceSequenceBadge({required this.sequence});
+
+  final String sequence;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: '顺序 $sequence · 可拖拽排序',
+      child: Container(
+        key: ValueKey('resource-sequence-$sequence'),
+        constraints: const BoxConstraints(minWidth: 25),
+        height: 24,
+        padding: const EdgeInsets.symmetric(horizontal: 5),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: scheme.primary.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: scheme.primary.withValues(alpha: 0.42)),
+        ),
+        child: Text(
+          sequence,
+          style: TextStyle(
+            color: scheme.primary,
+            fontSize: sequence.length > 3 ? 9 : 11,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ResourceGroupSection extends StatelessWidget {
   const _ResourceGroupSection({
     required this.group,
-    required this.assets,
-    required this.folders,
+    required this.sequence,
+    required this.parentGroupId,
+    required this.siblingKeys,
+    required this.headerAssets,
+    required this.headerFolders,
+    required this.childGroupCount,
+    required this.directAssets,
+    required this.childNodes,
     required this.usedIds,
     required this.previewIds,
     required this.previewAdding,
     required this.thumbnailSize,
-    required this.expandedFolderIds,
     required this.onToggleExpanded,
-    required this.onToggleFolderExpanded,
     required this.onToggleAsset,
     required this.onRemoveAsset,
     required this.onRangeHover,
-    required this.onDeleteFolderAsset,
-    required this.onOpenFolderDirectory,
     required this.onCreateAssetResourceGroup,
-    required this.onDropAsset,
-    required this.onDropPaths,
+    required this.onMoveNode,
+    required this.onRename,
   });
 
   final StoryboardResourceGroup group;
-  final List<StoryboardCutAsset> assets;
-  final List<StoryboardFolder> folders;
+  final String sequence;
+  final String? parentGroupId;
+  final List<String> siblingKeys;
+  final List<StoryboardCutAsset> headerAssets;
+  final List<StoryboardFolder> headerFolders;
+  final int childGroupCount;
+  final List<StoryboardCutAsset> directAssets;
+  final List<Widget> childNodes;
   final Set<String> usedIds;
   final Set<String> previewIds;
   final bool previewAdding;
   final double thumbnailSize;
-  final Set<String> expandedFolderIds;
   final VoidCallback onToggleExpanded;
-  final ValueChanged<String> onToggleFolderExpanded;
   final ValueChanged<StoryboardCutAsset> onToggleAsset;
   final ValueChanged<StoryboardCutAsset> onRemoveAsset;
   final ValueChanged<StoryboardCutAsset> onRangeHover;
-  final ValueChanged<StoryboardCutAsset> onDeleteFolderAsset;
-  final ValueChanged<StoryboardFolder> onOpenFolderDirectory;
   final ValueChanged<StoryboardCutAsset> onCreateAssetResourceGroup;
-  final Future<void> Function(StoryboardCutAsset asset, String folderId)
-  onDropAsset;
-  final Future<void> Function(Iterable<String> paths, String folderId)
-  onDropPaths;
+  final _ResourceNodeDropCallback onMoveNode;
+  final VoidCallback onRename;
 
   @override
   Widget build(BuildContext context) {
-    final hasExpandedContent = assets.isNotEmpty || folders.isNotEmpty;
+    final hasExpandedContent = directAssets.isNotEmpty || childNodes.isNotEmpty;
+    final dragData = _ResourceNodeDragData.group(group);
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _ResourceGroupHeader(
-            group: group,
-            assets: assets,
-            folders: folders,
-            usedIds: usedIds,
-            onTap: onToggleExpanded,
+          _ResourceNodeDropTarget(
+            target: dragData,
+            parentGroupId: parentGroupId,
+            siblingKeys: siblingKeys,
+            onDrop: onMoveNode,
+            child: _ResourceNodeDraggable(
+              data: dragData,
+              child: _ResourceGroupHeader(
+                group: group,
+                sequence: sequence,
+                assets: headerAssets,
+                folders: headerFolders,
+                childGroupCount: childGroupCount,
+                usedIds: usedIds,
+                onTap: onToggleExpanded,
+                onRename: onRename,
+              ),
+            ),
           ),
           AnimatedCrossFade(
             duration: const Duration(milliseconds: 180),
@@ -1654,36 +2190,21 @@ class _ResourceGroupSection extends StatelessWidget {
                 : CrossFadeState.showFirst,
             firstChild: const SizedBox.shrink(),
             secondChild: Padding(
-              padding: const EdgeInsets.only(top: 8),
+              padding: const EdgeInsets.only(top: 8, left: 14),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  for (final folder in folders)
-                    _AssetFolderGroup(
-                      folder: folder,
-                      expanded: expandedFolderIds.contains(folder.id),
-                      usedIds: usedIds,
-                      previewIds: previewIds,
-                      previewAdding: previewAdding,
-                      thumbnailSize: thumbnailSize,
-                      onToggleExpanded: () => onToggleFolderExpanded(folder.id),
-                      onToggleAsset: onToggleAsset,
-                      onRemoveAsset: onRemoveAsset,
-                      onDeleteAsset: onDeleteFolderAsset,
-                      onOpenDirectory: () => onOpenFolderDirectory(folder),
-                      onRangeHover: onRangeHover,
-                      onCreateAssetResourceGroup: onCreateAssetResourceGroup,
-                      onDropAsset: (asset) => onDropAsset(asset, folder.id),
-                      onDropPaths: (paths) => onDropPaths(paths, folder.id),
-                    ),
-                  if (assets.isNotEmpty)
+                  ...childNodes,
+                  if (childNodes.isNotEmpty && directAssets.isNotEmpty)
+                    const SizedBox(height: 4),
+                  if (directAssets.isNotEmpty)
                     ViewportLazyGrid(
-                      itemCount: assets.length,
+                      itemCount: directAssets.length,
                       itemExtent: thumbnailSize,
                       crossAxisSpacing: 8,
                       mainAxisSpacing: 8,
                       itemBuilder: (context, index) {
-                        final asset = assets[index];
+                        final asset = directAssets[index];
                         return _AssetThumb(
                           asset: asset,
                           used: usedIds.contains(asset.id),
@@ -1778,17 +2299,23 @@ class _ResourceGroupSelectionScope extends InheritedWidget {
 class _ResourceGroupHeader extends StatelessWidget {
   const _ResourceGroupHeader({
     required this.group,
+    required this.sequence,
     required this.assets,
     required this.folders,
+    required this.childGroupCount,
     required this.usedIds,
     required this.onTap,
+    required this.onRename,
   });
 
   final StoryboardResourceGroup group;
+  final String sequence;
   final List<StoryboardCutAsset> assets;
   final List<StoryboardFolder> folders;
+  final int childGroupCount;
   final Set<String> usedIds;
   final VoidCallback onTap;
+  final VoidCallback onRename;
 
   @override
   Widget build(BuildContext context) {
@@ -1807,9 +2334,13 @@ class _ResourceGroupHeader extends StatelessWidget {
               folder.assets.where((asset) => usedIds.contains(asset.id)).length,
         );
     final parts = <String>[
+      if (childGroupCount > 0) '$childGroupCount 个子编组',
       if (folders.isNotEmpty) '${folders.length} 个文件夹',
       if (directAssetCount > 0) '$directAssetCount 张图片',
-      if (folders.isEmpty && directAssetCount == 0 && folderAssetCount == 0)
+      if (childGroupCount == 0 &&
+          folders.isEmpty &&
+          directAssetCount == 0 &&
+          folderAssetCount == 0)
         '暂无资源',
     ];
     final summary = [
@@ -1821,6 +2352,8 @@ class _ResourceGroupHeader extends StatelessWidget {
       message: group.expanded ? '收起编组' : '展开编组',
       child: InkWell(
         onTap: onTap,
+        onSecondaryTapDown: (details) =>
+            _showContextMenu(context, details.globalPosition),
         borderRadius: BorderRadius.circular(8),
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 180),
@@ -1838,6 +2371,8 @@ class _ResourceGroupHeader extends StatelessWidget {
           ),
           child: Row(
             children: [
+              _ResourceSequenceBadge(sequence: sequence),
+              const SizedBox(width: 7),
               _ResourceGroupPreview(assets: assets, folders: folders),
               const SizedBox(width: 8),
               Expanded(
@@ -1875,6 +2410,40 @@ class _ResourceGroupHeader extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  Future<void> _showContextMenu(
+    BuildContext context,
+    Offset globalPosition,
+  ) async {
+    final action = await showMenu<_ResourceGroupContextAction>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        globalPosition.dx,
+        globalPosition.dy,
+        globalPosition.dx,
+        globalPosition.dy,
+      ),
+      items: const [
+        PopupMenuItem(
+          value: _ResourceGroupContextAction.rename,
+          child: Row(
+            children: [
+              Icon(Icons.edit_rounded, size: 18),
+              SizedBox(width: 10),
+              Text('重命名'),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (!context.mounted || action == null) {
+      return;
+    }
+    switch (action) {
+      case _ResourceGroupContextAction.rename:
+        onRename();
+    }
   }
 }
 
@@ -2014,6 +2583,9 @@ class _ThumbnailSizeControl extends StatelessWidget {
 class _AssetFolderGroup extends StatefulWidget {
   const _AssetFolderGroup({
     required this.folder,
+    required this.sequence,
+    required this.parentGroupId,
+    required this.siblingKeys,
     required this.expanded,
     required this.usedIds,
     required this.previewIds,
@@ -2028,9 +2600,13 @@ class _AssetFolderGroup extends StatefulWidget {
     required this.onCreateAssetResourceGroup,
     required this.onDropAsset,
     required this.onDropPaths,
+    required this.onMoveNode,
   });
 
   final StoryboardFolder folder;
+  final String sequence;
+  final String? parentGroupId;
+  final List<String> siblingKeys;
   final bool expanded;
   final Set<String> usedIds;
   final Set<String> previewIds;
@@ -2045,6 +2621,7 @@ class _AssetFolderGroup extends StatefulWidget {
   final ValueChanged<StoryboardCutAsset> onCreateAssetResourceGroup;
   final ValueChanged<StoryboardCutAsset> onDropAsset;
   final ValueChanged<Iterable<String>> onDropPaths;
+  final _ResourceNodeDropCallback onMoveNode;
 
   @override
   State<_AssetFolderGroup> createState() => _AssetFolderGroupState();
@@ -2072,13 +2649,23 @@ class _AssetFolderGroupState extends State<_AssetFolderGroup> {
             return Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _FolderHeader(
-                  folder: widget.folder,
-                  expanded: widget.expanded,
-                  highlighted: highlighted,
-                  usedIds: widget.usedIds,
-                  onTap: widget.onToggleExpanded,
-                  onOpenDirectory: widget.onOpenDirectory,
+                _ResourceNodeDropTarget(
+                  target: _ResourceNodeDragData.folder(widget.folder),
+                  parentGroupId: widget.parentGroupId,
+                  siblingKeys: widget.siblingKeys,
+                  onDrop: widget.onMoveNode,
+                  child: _ResourceNodeDraggable(
+                    data: _ResourceNodeDragData.folder(widget.folder),
+                    child: _FolderHeader(
+                      folder: widget.folder,
+                      sequence: widget.sequence,
+                      expanded: widget.expanded,
+                      highlighted: highlighted,
+                      usedIds: widget.usedIds,
+                      onTap: widget.onToggleExpanded,
+                      onOpenDirectory: widget.onOpenDirectory,
+                    ),
+                  ),
                 ),
                 AnimatedCrossFade(
                   duration: const Duration(milliseconds: 180),
@@ -2129,6 +2716,7 @@ class _AssetFolderGroupState extends State<_AssetFolderGroup> {
 class _FolderHeader extends StatelessWidget {
   const _FolderHeader({
     required this.folder,
+    required this.sequence,
     required this.expanded,
     required this.highlighted,
     required this.usedIds,
@@ -2137,6 +2725,7 @@ class _FolderHeader extends StatelessWidget {
   });
 
   final StoryboardFolder folder;
+  final String sequence;
   final bool expanded;
   final bool highlighted;
   final Set<String> usedIds;
@@ -2179,6 +2768,8 @@ class _FolderHeader extends StatelessWidget {
           ),
           child: Row(
             children: [
+              _ResourceSequenceBadge(sequence: sequence),
+              const SizedBox(width: 7),
               if (groupModeEnabled) ...[
                 Checkbox(
                   key: ValueKey('resource-group-folder-checkbox-${folder.id}'),
@@ -2350,6 +2941,9 @@ class _EmptyFolderHint extends StatelessWidget {
 
 class _AssetGroup extends StatelessWidget {
   const _AssetGroup({
+    required this.sequence,
+    required this.parentGroupId,
+    required this.siblingKeys,
     required this.title,
     required this.assets,
     required this.expanded,
@@ -2363,8 +2957,12 @@ class _AssetGroup extends StatelessWidget {
     required this.onRangeHover,
     required this.onCreateAssetResourceGroup,
     required this.onDeleteGroup,
+    required this.onMoveNode,
   });
 
+  final String sequence;
+  final String? parentGroupId;
+  final List<String> siblingKeys;
   final String title;
   final List<StoryboardCutAsset> assets;
   final bool expanded;
@@ -2378,6 +2976,7 @@ class _AssetGroup extends StatelessWidget {
   final ValueChanged<StoryboardCutAsset> onRangeHover;
   final ValueChanged<StoryboardCutAsset> onCreateAssetResourceGroup;
   final VoidCallback onDeleteGroup;
+  final _ResourceNodeDropCallback onMoveNode;
 
   @override
   Widget build(BuildContext context) {
@@ -2391,117 +2990,136 @@ class _AssetGroup extends StatelessWidget {
     final usedCount = assets
         .where((asset) => usedIds.contains(asset.id))
         .length;
+    final dragData = _ResourceNodeDragData.source(firstAsset.imageId, title);
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Tooltip(
-            message: expanded ? '收起裁切资源' : '展开裁切资源',
-            child: InkWell(
-              onTap: onToggleExpanded,
-              borderRadius: BorderRadius.circular(8),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 180),
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: expanded
-                      ? scheme.primaryContainer.withValues(alpha: 0.42)
-                      : scheme.surfaceContainerHighest.withValues(alpha: 0.38),
+          _ResourceNodeDropTarget(
+            target: dragData,
+            parentGroupId: parentGroupId,
+            siblingKeys: siblingKeys,
+            onDrop: onMoveNode,
+            child: _ResourceNodeDraggable(
+              data: dragData,
+              child: Tooltip(
+                message: expanded ? '收起裁切资源' : '展开裁切资源',
+                child: InkWell(
+                  onTap: onToggleExpanded,
                   borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: expanded
-                        ? scheme.primary.withValues(alpha: 0.45)
-                        : scheme.outlineVariant.withValues(alpha: 0.62),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    if (groupModeEnabled) ...[
-                      Checkbox(
-                        key: ValueKey(
-                          'resource-group-source-checkbox-${firstAsset.imageId}',
-                        ),
-                        value: groupChecked,
-                        onChanged: (value) =>
-                            groupSelection?.onSourceCheckedChanged(
-                              firstAsset.imageId,
-                              value ?? false,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 180),
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: expanded
+                          ? scheme.primaryContainer.withValues(alpha: 0.42)
+                          : scheme.surfaceContainerHighest.withValues(
+                              alpha: 0.38,
                             ),
-                        visualDensity: VisualDensity.compact,
-                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                        checkColor: scheme.onPrimary,
-                        fillColor: WidgetStateProperty.resolveWith((states) {
-                          return states.contains(WidgetState.selected)
-                              ? scheme.primary
-                              : scheme.surfaceContainerHighest;
-                        }),
-                        side: BorderSide(color: scheme.onSurface, width: 2),
-                      ),
-                      const SizedBox(width: 4),
-                    ],
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(6),
-                      child: Image.file(
-                        File(firstAsset.path),
-                        width: 42,
-                        height: 42,
-                        fit: BoxFit.cover,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: expanded
+                            ? scheme.primary.withValues(alpha: 0.45)
+                            : scheme.outlineVariant.withValues(alpha: 0.62),
                       ),
                     ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w800),
+                    child: Row(
+                      children: [
+                        _ResourceSequenceBadge(sequence: sequence),
+                        const SizedBox(width: 7),
+                        if (groupModeEnabled) ...[
+                          Checkbox(
+                            key: ValueKey(
+                              'resource-group-source-checkbox-${firstAsset.imageId}',
+                            ),
+                            value: groupChecked,
+                            onChanged: (value) =>
+                                groupSelection?.onSourceCheckedChanged(
+                                  firstAsset.imageId,
+                                  value ?? false,
+                                ),
+                            visualDensity: VisualDensity.compact,
+                            materialTapTargetSize:
+                                MaterialTapTargetSize.shrinkWrap,
+                            checkColor: scheme.onPrimary,
+                            fillColor: WidgetStateProperty.resolveWith((
+                              states,
+                            ) {
+                              return states.contains(WidgetState.selected)
+                                  ? scheme.primary
+                                  : scheme.surfaceContainerHighest;
+                            }),
+                            side: BorderSide(color: scheme.onSurface, width: 2),
                           ),
-                          const SizedBox(height: 3),
-                          Text(
-                            usedCount == 0
-                                ? '${assets.length} 张裁切图'
-                                : '${assets.length} 张裁切图 · 已用 $usedCount',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodySmall
-                                ?.copyWith(color: scheme.onSurfaceVariant),
-                          ),
+                          const SizedBox(width: 4),
                         ],
-                      ),
-                    ),
-                    AnimatedRotation(
-                      turns: expanded ? 0.5 : 0,
-                      duration: const Duration(milliseconds: 180),
-                      child: Icon(
-                        Icons.keyboard_arrow_down_rounded,
-                        color: scheme.onSurfaceVariant,
-                      ),
-                    ),
-                    const SizedBox(width: 2),
-                    Tooltip(
-                      message: '删除这组裁切资源',
-                      child: IconButton(
-                        onPressed: onDeleteGroup,
-                        icon: const Icon(Icons.delete_outline_rounded),
-                        iconSize: 18,
-                        padding: EdgeInsets.zero,
-                        constraints: const BoxConstraints.tightFor(
-                          width: 30,
-                          height: 30,
-                        ),
-                        style: IconButton.styleFrom(
-                          foregroundColor: scheme.error,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(7),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: Image.file(
+                            File(firstAsset.path),
+                            width: 36,
+                            height: 36,
+                            fit: BoxFit.cover,
                           ),
                         ),
-                      ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                title,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                usedCount == 0
+                                    ? '${assets.length} 张裁切图'
+                                    : '${assets.length} 张裁切图 · 已用 $usedCount',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodySmall
+                                    ?.copyWith(color: scheme.onSurfaceVariant),
+                              ),
+                            ],
+                          ),
+                        ),
+                        AnimatedRotation(
+                          turns: expanded ? 0.5 : 0,
+                          duration: const Duration(milliseconds: 180),
+                          child: Icon(
+                            Icons.keyboard_arrow_down_rounded,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(width: 2),
+                        Tooltip(
+                          message: '删除这组裁切资源',
+                          child: IconButton(
+                            onPressed: onDeleteGroup,
+                            icon: const Icon(Icons.delete_outline_rounded),
+                            iconSize: 18,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints.tightFor(
+                              width: 30,
+                              height: 30,
+                            ),
+                            style: IconButton.styleFrom(
+                              foregroundColor: scheme.error,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(7),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
+                  ),
                 ),
               ),
             ),

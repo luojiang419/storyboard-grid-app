@@ -38,7 +38,8 @@ bool _sameGridCutSidebarState(GridCutState previous, GridCutState next) {
   if (previous.selectedImageId != next.selectedImageId ||
       previous.isBusy != next.isBusy ||
       previous.images.length != next.images.length ||
-      previous.taskGroups.length != next.taskGroups.length) {
+      previous.taskGroups.length != next.taskGroups.length ||
+      !_sameStrings(previous.taskOrder, next.taskOrder)) {
     return false;
   }
   for (var index = 0; index < previous.images.length; index++) {
@@ -180,6 +181,7 @@ class _GridCutPageState extends ConsumerState<GridCutPage> {
                                             onGroup: controller.groupImageTasks,
                                             onToggleGroupExpanded: controller
                                                 .toggleTaskGroupExpanded,
+                                            onMoveNode: controller.moveTaskNode,
                                             onCollapse: () =>
                                                 _setImageSidebarExpanded(false),
                                           ),
@@ -659,6 +661,7 @@ class _ImageSidebar extends StatefulWidget {
     required this.onClear,
     required this.onGroup,
     required this.onToggleGroupExpanded,
+    required this.onMoveNode,
     required this.onCollapse,
   });
 
@@ -668,6 +671,12 @@ class _ImageSidebar extends StatefulWidget {
   final VoidCallback? onClear;
   final void Function(String name, Iterable<String> imageIds) onGroup;
   final ValueChanged<String> onToggleGroupExpanded;
+  final bool Function(
+    String nodeKey, {
+    String? targetGroupId,
+    String? beforeNodeKey,
+  })
+  onMoveNode;
   final VoidCallback onCollapse;
 
   @override
@@ -691,32 +700,79 @@ class _ImageSidebarState extends State<_ImageSidebar> {
     final imagesById = {
       for (final image in widget.state.images) image.id: image,
     };
-    final groupedIds = <String>{};
+    final groupsById = {
+      for (final group in widget.state.taskGroups) group.id: group,
+    };
+    final groupedIds = {
+      for (final group in widget.state.taskGroups) ...group.imageIds,
+    };
+    final fallbackRootOrder = <String>[
+      for (final group in widget.state.taskGroups)
+        GridCutTaskNodeRef.group(group.id).key,
+      for (final image in widget.state.images)
+        if (!groupedIds.contains(image.id))
+          GridCutTaskNodeRef.image(image.id).key,
+    ];
+    final rootOrder = widget.state.taskOrder.isEmpty
+        ? fallbackRootOrder
+        : widget.state.taskOrder;
     final sidebarItems = <Object>[];
-    for (final group in widget.state.taskGroups) {
-      final groupImages = [
-        for (final imageId in group.imageIds)
-          if (imagesById[imageId] != null) imagesById[imageId]!,
-      ];
-      if (groupImages.isEmpty) {
+    for (var rootIndex = 0; rootIndex < rootOrder.length; rootIndex++) {
+      final node = GridCutTaskNodeRef.tryParse(rootOrder[rootIndex]);
+      if (node == null) {
         continue;
       }
-      groupedIds.addAll(groupImages.map((image) => image.id));
-      sidebarItems.add(
-        _ImageTaskGroupHeaderItem(group: group, count: groupImages.length),
-      );
-      if (group.expanded) {
-        sidebarItems.addAll(groupImages);
+      final sequence = '${rootIndex + 1}';
+      if (node.kind == GridCutTaskNodeKind.group) {
+        final group = groupsById[node.id];
+        if (group == null) {
+          continue;
+        }
+        final childKeys = [
+          for (final imageId in group.imageIds)
+            if (imagesById.containsKey(imageId))
+              GridCutTaskNodeRef.image(imageId).key,
+        ];
+        sidebarItems.add(
+          _ImageTaskGroupHeaderItem(
+            group: group,
+            count: childKeys.length,
+            sequence: sequence,
+            siblingKeys: rootOrder,
+          ),
+        );
+        if (group.expanded) {
+          for (
+            var childIndex = 0;
+            childIndex < group.imageIds.length;
+            childIndex++
+          ) {
+            final image = imagesById[group.imageIds[childIndex]];
+            if (image != null) {
+              sidebarItems.add(
+                _ImageTaskItem(
+                  image: image,
+                  sequence: '$sequence.${childIndex + 1}',
+                  parentGroupId: group.id,
+                  siblingKeys: childKeys,
+                ),
+              );
+            }
+          }
+        }
+      } else {
+        final image = imagesById[node.id];
+        if (image != null) {
+          sidebarItems.add(
+            _ImageTaskItem(
+              image: image,
+              sequence: sequence,
+              siblingKeys: rootOrder,
+            ),
+          );
+        }
       }
     }
-    final ungroupedImages = [
-      for (final image in widget.state.images)
-        if (!groupedIds.contains(image.id)) image,
-    ];
-    if (sidebarItems.isNotEmpty && ungroupedImages.isNotEmpty) {
-      sidebarItems.add(_UngroupedTaskHeaderItem(ungroupedImages.length));
-    }
-    sidebarItems.addAll(ungroupedImages);
     return Container(
       decoration: BoxDecoration(
         color: scheme.surfaceContainerLow.withValues(alpha: 0.72),
@@ -789,33 +845,50 @@ class _ImageSidebarState extends State<_ImageSidebar> {
                       if (item is _ImageTaskGroupHeaderItem) {
                         return Padding(
                           padding: const EdgeInsets.only(bottom: 8),
-                          child: _ImageTaskGroupHeader(
-                            group: item.group,
-                            count: item.count,
-                            onTap: () =>
-                                widget.onToggleGroupExpanded(item.group.id),
+                          child: _TaskNodeDropTarget(
+                            target: _TaskNodeDragData.group(item.group),
+                            siblingKeys: item.siblingKeys,
+                            onDrop: _moveDroppedTask,
+                            child: _TaskNodeDraggable(
+                              data: _TaskNodeDragData.group(item.group),
+                              child: _ImageTaskGroupHeader(
+                                group: item.group,
+                                count: item.count,
+                                sequence: item.sequence,
+                                onTap: () =>
+                                    widget.onToggleGroupExpanded(item.group.id),
+                              ),
+                            ),
                           ),
                         );
                       }
-                      if (item is _UngroupedTaskHeaderItem) {
-                        return _UngroupedTaskHeader(count: item.count);
-                      }
-                      final image = item as GridCutImage;
+                      final taskItem = item as _ImageTaskItem;
+                      final image = taskItem.image;
                       final selected =
                           image.id == widget.state.selectedImage?.id;
-                      return _ImageListTile(
-                        image: image,
-                        selected: selected,
-                        groupModeEnabled: _groupModeEnabled,
-                        groupChecked: _groupImageIds.contains(image.id),
-                        onTap: () => _handleImageTap(image),
-                        onGroupCheckedChanged: (checked) =>
-                            _setGroupImageChecked(image.id, checked),
-                        onSecondaryTapDown: (position) =>
-                            _showImageContextMenu(position, image),
-                        onRemove: widget.onRemove == null
-                            ? null
-                            : () => widget.onRemove!(image.id),
+                      return _TaskNodeDropTarget(
+                        target: _TaskNodeDragData.image(image),
+                        parentGroupId: taskItem.parentGroupId,
+                        siblingKeys: taskItem.siblingKeys,
+                        onDrop: _moveDroppedTask,
+                        child: _TaskNodeDraggable(
+                          data: _TaskNodeDragData.image(image),
+                          child: _ImageListTile(
+                            image: image,
+                            sequence: taskItem.sequence,
+                            selected: selected,
+                            groupModeEnabled: _groupModeEnabled,
+                            groupChecked: _groupImageIds.contains(image.id),
+                            onTap: () => _handleImageTap(image),
+                            onGroupCheckedChanged: (checked) =>
+                                _setGroupImageChecked(image.id, checked),
+                            onSecondaryTapDown: (position) =>
+                                _showImageContextMenu(position, image),
+                            onRemove: widget.onRemove == null
+                                ? null
+                                : () => widget.onRemove!(image.id),
+                          ),
+                        ),
                       );
                     },
                   ),
@@ -827,6 +900,36 @@ class _ImageSidebarState extends State<_ImageSidebar> {
 
   void _handleImageTap(GridCutImage image) {
     widget.onSelect(image.id);
+  }
+
+  void _moveDroppedTask(
+    _TaskNodeDragData data,
+    _TaskNodeDragData target,
+    String? targetParentGroupId,
+    List<String> siblingKeys,
+    _TaskDropPlacement placement,
+  ) {
+    if (data.nodeKey == target.nodeKey) {
+      return;
+    }
+    if (placement == _TaskDropPlacement.inside) {
+      widget.onMoveNode(data.nodeKey, targetGroupId: target.id);
+      return;
+    }
+    String? beforeNodeKey;
+    if (placement == _TaskDropPlacement.before) {
+      beforeNodeKey = target.nodeKey;
+    } else {
+      final targetIndex = siblingKeys.indexOf(target.nodeKey);
+      if (targetIndex >= 0 && targetIndex + 1 < siblingKeys.length) {
+        beforeNodeKey = siblingKeys[targetIndex + 1];
+      }
+    }
+    widget.onMoveNode(
+      data.nodeKey,
+      targetGroupId: targetParentGroupId,
+      beforeNodeKey: beforeNodeKey,
+    );
   }
 
   void _setGroupModeEnabled(bool enabled) {
@@ -992,16 +1095,289 @@ class _ImageSidebarState extends State<_ImageSidebar> {
 }
 
 class _ImageTaskGroupHeaderItem {
-  const _ImageTaskGroupHeaderItem({required this.group, required this.count});
+  const _ImageTaskGroupHeaderItem({
+    required this.group,
+    required this.count,
+    required this.sequence,
+    required this.siblingKeys,
+  });
 
   final GridCutTaskGroup group;
   final int count;
+  final String sequence;
+  final List<String> siblingKeys;
 }
 
-class _UngroupedTaskHeaderItem {
-  const _UngroupedTaskHeaderItem(this.count);
+class _ImageTaskItem {
+  const _ImageTaskItem({
+    required this.image,
+    required this.sequence,
+    this.parentGroupId,
+    required this.siblingKeys,
+  });
 
-  final int count;
+  final GridCutImage image;
+  final String sequence;
+  final String? parentGroupId;
+  final List<String> siblingKeys;
+}
+
+enum _TaskDropPlacement { before, inside, after }
+
+class _TaskNodeDragData {
+  const _TaskNodeDragData({
+    required this.kind,
+    required this.id,
+    required this.label,
+  });
+
+  factory _TaskNodeDragData.group(GridCutTaskGroup group) {
+    return _TaskNodeDragData(
+      kind: GridCutTaskNodeKind.group,
+      id: group.id,
+      label: group.name,
+    );
+  }
+
+  factory _TaskNodeDragData.image(GridCutImage image) {
+    return _TaskNodeDragData(
+      kind: GridCutTaskNodeKind.image,
+      id: image.id,
+      label: image.originalName,
+    );
+  }
+
+  final GridCutTaskNodeKind kind;
+  final String id;
+  final String label;
+
+  String get nodeKey => GridCutTaskNodeRef(kind: kind, id: id).key;
+}
+
+class _TaskNodeDraggable extends StatelessWidget {
+  const _TaskNodeDraggable({required this.data, required this.child});
+
+  final _TaskNodeDragData data;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Draggable<_TaskNodeDragData>(
+      key: ValueKey('task-node-draggable-${data.nodeKey}'),
+      data: data,
+      maxSimultaneousDrags: 1,
+      rootOverlay: true,
+      dragAnchorStrategy: pointerDragAnchorStrategy,
+      feedback: _TaskNodeDragFeedback(data: data),
+      childWhenDragging: Opacity(opacity: 0.48, child: child),
+      child: MouseRegion(cursor: SystemMouseCursors.grab, child: child),
+    );
+  }
+}
+
+class _TaskNodeDragFeedback extends StatelessWidget {
+  const _TaskNodeDragFeedback({required this.data});
+
+  final _TaskNodeDragData data;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        constraints: const BoxConstraints(maxWidth: 220),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.82),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.3)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              data.kind == GridCutTaskNodeKind.group
+                  ? Icons.folder_rounded
+                  : Icons.image_rounded,
+              size: 18,
+              color: Colors.white,
+            ),
+            const SizedBox(width: 8),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 170),
+              child: Text(
+                data.label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TaskNodeDropTarget extends StatefulWidget {
+  const _TaskNodeDropTarget({
+    required this.target,
+    this.parentGroupId,
+    required this.siblingKeys,
+    required this.onDrop,
+    required this.child,
+  });
+
+  final _TaskNodeDragData target;
+  final String? parentGroupId;
+  final List<String> siblingKeys;
+  final void Function(
+    _TaskNodeDragData data,
+    _TaskNodeDragData target,
+    String? targetParentGroupId,
+    List<String> siblingKeys,
+    _TaskDropPlacement placement,
+  )
+  onDrop;
+  final Widget child;
+
+  @override
+  State<_TaskNodeDropTarget> createState() => _TaskNodeDropTargetState();
+}
+
+class _TaskNodeDropTargetState extends State<_TaskNodeDropTarget> {
+  _TaskDropPlacement _placement = _TaskDropPlacement.before;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return DragTarget<_TaskNodeDragData>(
+      key: ValueKey('task-node-drop-${widget.target.nodeKey}'),
+      onWillAcceptWithDetails: (details) =>
+          details.data.nodeKey != widget.target.nodeKey,
+      onMove: (details) => _updatePlacement(details.data, details.offset),
+      onLeave: (_) {
+        if (mounted) {
+          setState(() => _placement = _TaskDropPlacement.before);
+        }
+      },
+      onAcceptWithDetails: (details) {
+        _updatePlacement(details.data, details.offset, rebuild: false);
+        widget.onDrop(
+          details.data,
+          widget.target,
+          widget.parentGroupId,
+          widget.siblingKeys,
+          _placement,
+        );
+      },
+      builder: (context, candidates, _) {
+        final highlighted = candidates.isNotEmpty;
+        return Stack(
+          clipBehavior: Clip.none,
+          children: [
+            widget.child,
+            if (highlighted)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(8),
+                      border: _placement == _TaskDropPlacement.inside
+                          ? Border.all(color: scheme.primary, width: 2)
+                          : null,
+                    ),
+                  ),
+                ),
+              ),
+            if (highlighted && _placement != _TaskDropPlacement.inside)
+              Positioned(
+                left: 2,
+                right: 2,
+                top: _placement == _TaskDropPlacement.before ? -2 : null,
+                bottom: _placement == _TaskDropPlacement.after ? -2 : null,
+                child: IgnorePointer(
+                  child: Container(
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: scheme.primary,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _updatePlacement(
+    _TaskNodeDragData data,
+    Offset globalOffset, {
+    bool rebuild = true,
+  }) {
+    final renderBox = context.findRenderObject();
+    if (renderBox is! RenderBox || !renderBox.hasSize) {
+      return;
+    }
+    final local = renderBox.globalToLocal(globalOffset);
+    final ratio = (local.dy / renderBox.size.height).clamp(0.0, 1.0);
+    final next =
+        widget.target.kind == GridCutTaskNodeKind.group &&
+            data.kind == GridCutTaskNodeKind.image &&
+            ratio >= 0.25 &&
+            ratio <= 0.75
+        ? _TaskDropPlacement.inside
+        : ratio < 0.5
+        ? _TaskDropPlacement.before
+        : _TaskDropPlacement.after;
+    if (next == _placement) {
+      return;
+    }
+    if (rebuild && mounted) {
+      setState(() => _placement = next);
+    } else {
+      _placement = next;
+    }
+  }
+}
+
+class _TaskSequenceBadge extends StatelessWidget {
+  const _TaskSequenceBadge({required this.sequence});
+
+  final String sequence;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: '顺序 $sequence · 可拖拽排序',
+      child: Container(
+        key: ValueKey('task-sequence-$sequence'),
+        constraints: const BoxConstraints(minWidth: 25),
+        height: 24,
+        padding: const EdgeInsets.symmetric(horizontal: 5),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: scheme.primary.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: scheme.primary.withValues(alpha: 0.42)),
+        ),
+        child: Text(
+          sequence,
+          style: TextStyle(
+            color: scheme.primary,
+            fontSize: sequence.length > 3 ? 9 : 11,
+            fontWeight: FontWeight.w900,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _TaskGroupModeToggle extends StatelessWidget {
@@ -1041,6 +1417,7 @@ class _TaskGroupModeToggle extends StatelessWidget {
 class _ImageListTile extends StatelessWidget {
   const _ImageListTile({
     required this.image,
+    required this.sequence,
     required this.selected,
     required this.groupModeEnabled,
     required this.groupChecked,
@@ -1051,6 +1428,7 @@ class _ImageListTile extends StatelessWidget {
   });
 
   final GridCutImage image;
+  final String sequence;
   final bool selected;
   final bool groupModeEnabled;
   final bool groupChecked;
@@ -1097,6 +1475,8 @@ class _ImageListTile extends StatelessWidget {
           ),
           child: Row(
             children: [
+              _TaskSequenceBadge(sequence: sequence),
+              const SizedBox(width: 7),
               if (groupModeEnabled) ...[
                 Checkbox(
                   key: ValueKey('image-task-group-checkbox-${image.id}'),
@@ -1179,11 +1559,13 @@ class _ImageTaskGroupHeader extends StatelessWidget {
   const _ImageTaskGroupHeader({
     required this.group,
     required this.count,
+    required this.sequence,
     required this.onTap,
   });
 
   final GridCutTaskGroup group;
   final int count;
+  final String sequence;
   final VoidCallback onTap;
 
   @override
@@ -1208,6 +1590,8 @@ class _ImageTaskGroupHeader extends StatelessWidget {
         ),
         child: Row(
           children: [
+            _TaskSequenceBadge(sequence: sequence),
+            const SizedBox(width: 7),
             Icon(Icons.folder_rounded, color: scheme.onSurfaceVariant),
             const SizedBox(width: 8),
             Expanded(
@@ -1239,51 +1623,6 @@ class _ImageTaskGroupHeader extends StatelessWidget {
               ),
             ),
           ],
-        ),
-      ),
-    );
-  }
-}
-
-class _UngroupedTaskHeader extends StatelessWidget {
-  const _UngroupedTaskHeader({required this.count});
-
-  final int count;
-
-  @override
-  Widget build(BuildContext context) {
-    final scheme = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 8),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          decoration: BoxDecoration(
-            color: scheme.surfaceContainerHighest.withValues(alpha: 0.24),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                Icons.inbox_rounded,
-                size: 18,
-                color: scheme.onSurfaceVariant,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '未编组 · $count 张',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: scheme.onSurfaceVariant,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ),
-            ],
-          ),
         ),
       ),
     );

@@ -19,6 +19,7 @@ import 'package:storyboard_grid_app/features/exporter/presentation/exporter_page
 import 'package:storyboard_grid_app/features/grid_cut/application/grid_cut_controller.dart';
 import 'package:storyboard_grid_app/features/grid_cut/data/grid_crop_service.dart';
 import 'package:storyboard_grid_app/features/grid_cut/data/grid_detection_service.dart';
+import 'package:storyboard_grid_app/features/grid_cut/domain/grid_cut_models.dart';
 import 'package:storyboard_grid_app/features/grid_cut/presentation/grid_cut_page.dart';
 import 'package:storyboard_grid_app/features/settings/application/settings_controller.dart';
 import 'package:storyboard_grid_app/features/settings/data/settings_repository.dart';
@@ -408,6 +409,98 @@ void main() {
     for (final assetId in assetIds) {
       expect(find.byKey(ValueKey('asset-thumb-$assetId')), findsOneWidget);
     }
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('裁切资源文件夹可拖入编组并按层级动态编号和右键重命名', (tester) async {
+    late final Directory root;
+    late final AppDirectories directories;
+    late final AppDatabase database;
+    late final StoryboardController controller;
+    late final StoryboardFolder firstFolder;
+    late final StoryboardFolder secondFolder;
+    late final StoryboardResourceGroup group;
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp('resource_tree_widget_');
+      directories = await AppDirectories.create(executableDirectory: root);
+      database = await AppDatabase.open(directories.databaseFile);
+      controller = StoryboardController(
+        database: database,
+        directories: directories,
+      );
+      await controller.createFolder('文件夹一');
+      await controller.createFolder('文件夹二');
+      firstFolder = controller.value.folders.firstWhere(
+        (folder) => folder.name == '文件夹一',
+      );
+      secondFolder = controller.value.folders.firstWhere(
+        (folder) => folder.name == '文件夹二',
+      );
+      await controller.createResourceGroup(
+        name: '父编组',
+        folderIds: [firstFolder.id],
+      );
+      group = controller.value.resourceGroups.single;
+    });
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [storyboardControllerProvider.overrideWithValue(controller)],
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('resource-sequence-1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('resource-sequence-2')), findsOneWidget);
+
+    final source = find.byKey(
+      ValueKey(
+        'resource-node-draggable-${StoryboardResourceNodeRef.folder(secondFolder.id).key}',
+      ),
+    );
+    final target = find.byKey(
+      ValueKey(
+        'resource-node-drop-${StoryboardResourceNodeRef.group(group.id).key}',
+      ),
+    );
+    final gesture = await tester.startGesture(tester.getCenter(source));
+    await gesture.moveTo(tester.getCenter(target));
+    await tester.pump();
+    await gesture.up();
+    await tester.pumpAndSettle();
+
+    final movedGroup = controller.value.resourceGroups.single;
+    expect(
+      movedGroup.folderIds,
+      containsAll([firstFolder.id, secondFolder.id]),
+    );
+    expect(controller.value.resourceRootOrder, [
+      StoryboardResourceNodeRef.group(group.id).key,
+    ]);
+    expect(find.byKey(const ValueKey('resource-sequence-2')), findsNothing);
+    expect(find.byKey(const ValueKey('resource-sequence-1.2')), findsOneWidget);
+
+    await tester.tap(find.text('父编组'), buttons: kSecondaryMouseButton);
+    await tester.pumpAndSettle();
+    expect(find.text('重命名'), findsOneWidget);
+    await tester.tap(find.text('重命名'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextFormField), '镜头资料');
+    await tester.tap(find.text('保存'));
+    await tester.pumpAndSettle();
+    expect(controller.value.resourceGroups.single.name, '镜头资料');
+    expect(find.text('镜头资料'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox.shrink());
   });
@@ -2004,6 +2097,32 @@ void main() {
     expect(gridCutController.value.taskGroups.single.imageIds, [
       firstImageId,
       secondImageId,
+    ]);
+    expect(find.byKey(const ValueKey('task-sequence-1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('task-sequence-1.1')), findsOneWidget);
+    expect(find.byKey(const ValueKey('task-sequence-1.2')), findsOneWidget);
+
+    final secondTaskDrag = find.byKey(
+      ValueKey(
+        'task-node-draggable-${GridCutTaskNodeRef.image(secondImageId).key}',
+      ),
+    );
+    final firstTaskDrop = find.byKey(
+      ValueKey('task-node-drop-${GridCutTaskNodeRef.image(firstImageId).key}'),
+    );
+    final firstTaskRect = tester.getRect(firstTaskDrop);
+    final taskGesture = await tester.startGesture(
+      tester.getCenter(secondTaskDrag),
+    );
+    await taskGesture.moveTo(
+      Offset(firstTaskRect.center.dx, firstTaskRect.top + 2),
+    );
+    await tester.pump();
+    await taskGesture.up();
+    await tester.pumpAndSettle();
+    expect(gridCutController.value.taskGroups.single.imageIds, [
+      secondImageId,
+      firstImageId,
     ]);
     expect(
       tester

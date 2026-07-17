@@ -49,6 +49,8 @@ class StoryboardResourceGroup {
     required this.assetIds,
     required this.sourceImageIds,
     required this.folderIds,
+    this.parentGroupId,
+    this.childOrder = const [],
     this.expanded = true,
   });
 
@@ -57,6 +59,8 @@ class StoryboardResourceGroup {
   final List<String> assetIds;
   final List<String> sourceImageIds;
   final List<String> folderIds;
+  final String? parentGroupId;
+  final List<String> childOrder;
   final bool expanded;
 
   bool get isEmpty =>
@@ -67,6 +71,8 @@ class StoryboardResourceGroup {
     List<String>? assetIds,
     List<String>? sourceImageIds,
     List<String>? folderIds,
+    Object? parentGroupId = _copyWithSentinel,
+    List<String>? childOrder,
     bool? expanded,
   }) {
     return StoryboardResourceGroup(
@@ -75,8 +81,47 @@ class StoryboardResourceGroup {
       assetIds: assetIds ?? this.assetIds,
       sourceImageIds: sourceImageIds ?? this.sourceImageIds,
       folderIds: folderIds ?? this.folderIds,
+      parentGroupId: identical(parentGroupId, _copyWithSentinel)
+          ? this.parentGroupId
+          : parentGroupId as String?,
+      childOrder: childOrder ?? this.childOrder,
       expanded: expanded ?? this.expanded,
     );
+  }
+}
+
+enum StoryboardResourceNodeKind { group, folder, source }
+
+class StoryboardResourceNodeRef {
+  const StoryboardResourceNodeRef({required this.kind, required this.id});
+
+  const StoryboardResourceNodeRef.group(String id)
+    : this(kind: StoryboardResourceNodeKind.group, id: id);
+
+  const StoryboardResourceNodeRef.folder(String id)
+    : this(kind: StoryboardResourceNodeKind.folder, id: id);
+
+  const StoryboardResourceNodeRef.source(String id)
+    : this(kind: StoryboardResourceNodeKind.source, id: id);
+
+  final StoryboardResourceNodeKind kind;
+  final String id;
+
+  String get key => '${kind.name}:$id';
+
+  static StoryboardResourceNodeRef? tryParse(String value) {
+    final separator = value.indexOf(':');
+    if (separator <= 0 || separator == value.length - 1) {
+      return null;
+    }
+    final kindName = value.substring(0, separator);
+    final id = value.substring(separator + 1);
+    for (final kind in StoryboardResourceNodeKind.values) {
+      if (kind.name == kindName) {
+        return StoryboardResourceNodeRef(kind: kind, id: id);
+      }
+    }
+    return null;
   }
 }
 
@@ -556,6 +601,7 @@ class StoryboardState {
     required this.assets,
     required this.folders,
     required this.resourceGroups,
+    this.resourceRootOrder = const [],
     required this.boards,
     this.boardGroups = const [],
     this.openBoardIds = const [],
@@ -574,6 +620,7 @@ class StoryboardState {
     : assets = const [],
       folders = const [],
       resourceGroups = const [],
+      resourceRootOrder = const [],
       boards = const [],
       boardGroups = const [],
       openBoardIds = const [],
@@ -590,6 +637,7 @@ class StoryboardState {
   final List<StoryboardCutAsset> assets;
   final List<StoryboardFolder> folders;
   final List<StoryboardResourceGroup> resourceGroups;
+  final List<String> resourceRootOrder;
   final List<StoryboardBoard> boards;
   final List<StoryboardBoardGroup> boardGroups;
   final List<String> openBoardIds;
@@ -644,6 +692,7 @@ class StoryboardState {
     List<StoryboardCutAsset>? assets,
     List<StoryboardFolder>? folders,
     List<StoryboardResourceGroup>? resourceGroups,
+    List<String>? resourceRootOrder,
     List<StoryboardBoard>? boards,
     List<StoryboardBoardGroup>? boardGroups,
     List<String>? openBoardIds,
@@ -661,6 +710,7 @@ class StoryboardState {
       assets: assets ?? this.assets,
       folders: folders ?? this.folders,
       resourceGroups: resourceGroups ?? this.resourceGroups,
+      resourceRootOrder: resourceRootOrder ?? this.resourceRootOrder,
       boards: boards ?? this.boards,
       boardGroups: boardGroups ?? this.boardGroups,
       openBoardIds: openBoardIds ?? this.openBoardIds,
