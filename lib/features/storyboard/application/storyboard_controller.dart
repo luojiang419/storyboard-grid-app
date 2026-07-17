@@ -99,6 +99,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
   static const _selectionStateKey = 'storyboardWorkspaceSelection';
   static const _workspaceSnapshotVersion = 2;
   static const _maxGridExtent = 12;
+  static const _historyLimit = 100;
 
   final AppDatabase _database;
   final WorkspaceDirectories? _directories;
@@ -121,6 +122,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
   var _visionOperationToken = 0;
   var _visionCancelRequested = false;
   final _visionTaskQueue = <_QueuedVisionTask>[];
+  final _undoHistoryByBoardId = <String, List<StoryboardBoard>>{};
+  final _redoHistoryByBoardId = <String, List<StoryboardBoard>>{};
   _QueuedVisionTask? _activeVisionTask;
   var _visionQueueRunning = false;
 
@@ -805,6 +808,13 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     );
   }
 
+  void closeSelectedBoard() {
+    final boardId = value.selectedBoardId;
+    if (boardId != null) {
+      closeBoard(boardId);
+    }
+  }
+
   void openBoard(String boardId) {
     final board = value.boards.cast<StoryboardBoard?>().firstWhere(
       (item) => item?.id == boardId,
@@ -982,6 +992,60 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       return;
     }
     _setState(value.copyWith(selectedBoardId: boardId), saveWorkspace: false);
+  }
+
+  void selectNextOpenBoard() {
+    final openBoardIds = value.openBoardIds;
+    if (openBoardIds.length < 2) {
+      return;
+    }
+    final currentIndex = openBoardIds.indexOf(value.selectedBoardId ?? '');
+    final nextIndex = currentIndex < 0
+        ? 0
+        : (currentIndex + 1) % openBoardIds.length;
+    selectBoard(openBoardIds[nextIndex]);
+  }
+
+  bool get canUndoSelectedBoard {
+    final boardId = value.selectedBoardId;
+    return boardId != null &&
+        (_undoHistoryByBoardId[boardId]?.isNotEmpty ?? false);
+  }
+
+  bool get canRedoSelectedBoard {
+    final boardId = value.selectedBoardId;
+    return boardId != null &&
+        (_redoHistoryByBoardId[boardId]?.isNotEmpty ?? false);
+  }
+
+  void undoSelectedBoard() {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    final undoHistory = _undoHistoryByBoardId[board.id];
+    if (undoHistory == null || undoHistory.isEmpty) {
+      value = value.copyWith(message: '没有可撤销的操作');
+      return;
+    }
+    final previousBoard = undoHistory.removeLast();
+    _pushBoardHistory(_redoHistoryByBoardId, board);
+    _restoreBoardFromHistory(previousBoard, message: '已撤销上一步操作');
+  }
+
+  void redoSelectedBoard() {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    final redoHistory = _redoHistoryByBoardId[board.id];
+    if (redoHistory == null || redoHistory.isEmpty) {
+      value = value.copyWith(message: '没有可恢复的操作');
+      return;
+    }
+    final nextBoard = redoHistory.removeLast();
+    _pushBoardHistory(_undoHistoryByBoardId, board);
+    _restoreBoardFromHistory(nextBoard, message: '已恢复下一步操作');
   }
 
   void toggleSelectedBoardLock() {
@@ -2481,6 +2545,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     final nextBoard = _compactBoardItems(
       board.copyWith(width: nextWidth, height: nextHeight, gap: nextGap),
     );
+    _recordBoardHistory(board);
     _setState(
       value.copyWith(
         boards: [
@@ -2725,6 +2790,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     final nextBoard = _boardWithAdaptiveHeight(
       currentBoard.copyWith(items: nextItems),
     );
+    _recordBoardHistory(currentBoard);
     _setState(
       value.copyWith(
         assets: [
@@ -3351,6 +3417,13 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     bool selectBoard = true,
   }) {
     final nextBoard = _boardWithAdaptiveHeight(board);
+    final previousBoard = value.boards.cast<StoryboardBoard?>().firstWhere(
+      (item) => item?.id == nextBoard.id,
+      orElse: () => null,
+    );
+    if (previousBoard != null) {
+      _recordBoardHistory(previousBoard);
+    }
     _setState(
       value.copyWith(
         boards: [
@@ -3365,6 +3438,37 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         reorderAnimationToken: reorderAnimationToken,
       ),
       saveWorkspace: saveWorkspace,
+    );
+  }
+
+  void _recordBoardHistory(StoryboardBoard board) {
+    _pushBoardHistory(_undoHistoryByBoardId, board);
+    _redoHistoryByBoardId.remove(board.id);
+  }
+
+  void _pushBoardHistory(
+    Map<String, List<StoryboardBoard>> histories,
+    StoryboardBoard board,
+  ) {
+    final history = histories.putIfAbsent(board.id, () => <StoryboardBoard>[]);
+    history.add(board);
+    if (history.length > _historyLimit) {
+      history.removeAt(0);
+    }
+  }
+
+  void _restoreBoardFromHistory(
+    StoryboardBoard board, {
+    required String message,
+  }) {
+    _setState(
+      value.copyWith(
+        boards: [
+          for (final item in value.boards)
+            if (item.id == board.id) board else item,
+        ],
+        message: message,
+      ),
     );
   }
 

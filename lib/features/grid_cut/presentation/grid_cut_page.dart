@@ -1412,10 +1412,24 @@ class _ZoomableCropViewport extends StatefulWidget {
 }
 
 class _ZoomableCropViewportState extends State<_ZoomableCropViewport> {
-  static const _minZoom = 1.0;
-  static const _maxZoom = 8.0;
+  static const _minZoom = 0.1;
+  static const _maxZoom = 10.0;
   static const _panStartSlop = 3.0;
-  static const _zoomPresets = [1.0, 1.25, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0];
+  static const _zoomPresets = [
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    8.0,
+    10.0,
+  ];
 
   double _zoom = 1;
   Offset _panOffset = Offset.zero;

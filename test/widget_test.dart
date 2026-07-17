@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image/image.dart' as img;
@@ -165,6 +166,18 @@ void main() {
       ),
     );
 
+    expect(find.byTooltip('展开全部'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey('resource-expand-collapse-all')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('收纳全部'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey('resource-expand-collapse-all')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byTooltip('展开全部'), findsOneWidget);
+
     await tester.tap(find.text('修改'), buttons: kSecondaryMouseButton);
     await tester.pumpAndSettle();
     expect(find.text('打开目录'), findsOneWidget);
@@ -210,6 +223,19 @@ void main() {
     await tester.tap(find.text('创建'));
     await tester.pumpAndSettle();
     expect(find.text('新编组'), findsOneWidget);
+    expect(controller.value.resourceGroups.single.expanded, isTrue);
+    expect(find.byTooltip('收纳全部'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey('resource-expand-collapse-all')),
+    );
+    await tester.pumpAndSettle();
+    expect(controller.value.resourceGroups.single.expanded, isFalse);
+    expect(find.byTooltip('展开全部'), findsOneWidget);
+    await tester.tap(
+      find.byKey(const ValueKey('resource-expand-collapse-all')),
+    );
+    await tester.pumpAndSettle();
+    expect(controller.value.resourceGroups.single.expanded, isTrue);
     fileExplorerService.openedPath = null;
     await tester.tap(find.text('修改'), buttons: kSecondaryMouseButton);
     await tester.pumpAndSettle();
@@ -475,6 +501,56 @@ void main() {
     expect(find.text('当前没有打开的画板'), findsOneWidget);
     await tester.pump(const Duration(milliseconds: 150));
 
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('故事板键盘快捷键支持撤销恢复、循环切换和关闭当前画板', (tester) async {
+    late final Directory root;
+    late final AppDatabase database;
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp('storyboard_shortcuts_');
+      database = await AppDatabase.open(
+        File('${root.path}${Platform.pathSeparator}storyboard.sqlite'),
+      );
+    });
+    final controller = StoryboardController(database: database)..addBoard();
+    final firstBoardId = controller.value.openBoardIds.first;
+    final secondBoardId = controller.value.selectedBoardId!;
+    controller.setGrid(2, 2);
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [storyboardControllerProvider.overrideWithValue(controller)],
+        child: MaterialApp(
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await _sendControlShortcut(tester, LogicalKeyboardKey.keyZ);
+    expect(controller.value.selectedBoard!.rows, 3);
+    expect(controller.value.selectedBoard!.columns, 3);
+
+    await _sendControlShortcut(tester, LogicalKeyboardKey.keyZ, shift: true);
+    expect(controller.value.selectedBoard!.rows, 2);
+    expect(controller.value.selectedBoard!.columns, 2);
+
+    await _sendControlShortcut(tester, LogicalKeyboardKey.tab);
+    expect(controller.value.selectedBoardId, firstBoardId);
+
+    await _sendControlShortcut(tester, LogicalKeyboardKey.keyW);
+    expect(controller.value.boards, hasLength(2));
+    expect(controller.value.openBoardIds, [secondBoardId]);
+    expect(controller.value.selectedBoardId, secondBoardId);
+
+    await tester.pump(const Duration(milliseconds: 150));
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -1812,6 +1888,20 @@ void main() {
     expect(cropZoomRect.right, closeTo(cropViewportRect.right - 12, 0.5));
     expect(cropZoomRect.bottom, closeTo(cropViewportRect.bottom - 12, 0.5));
 
+    await tester.tap(find.byTooltip('缩放比例'));
+    await tester.pumpAndSettle();
+    expect(find.text('10%'), findsOneWidget);
+    expect(find.text('1000%'), findsOneWidget);
+    await tester.tap(find.text('10%'));
+    await tester.pumpAndSettle();
+    expect(find.text('10%'), findsOneWidget);
+    await tester.tap(find.byTooltip('缩放比例'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('1000%'));
+    await tester.tap(find.text('1000%'));
+    await tester.pumpAndSettle();
+    expect(find.text('1000%'), findsOneWidget);
+
     await tester.tap(find.byTooltip('添加竖向裁切线'));
     await tester.pump();
     final verticalRuler = find.byKey(const ValueKey('grid-cut-ruler-vertical'));
@@ -2387,6 +2477,24 @@ void main() {
 
     await tester.pumpWidget(const SizedBox.shrink());
   });
+}
+
+Future<void> _sendControlShortcut(
+  WidgetTester tester,
+  LogicalKeyboardKey key, {
+  bool shift = false,
+}) async {
+  await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+  if (shift) {
+    await tester.sendKeyDownEvent(LogicalKeyboardKey.shiftLeft);
+  }
+  await tester.sendKeyDownEvent(key);
+  await tester.sendKeyUpEvent(key);
+  if (shift) {
+    await tester.sendKeyUpEvent(LogicalKeyboardKey.shiftLeft);
+  }
+  await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+  await tester.pump();
 }
 
 bool _isCropCanvasPositioned(Widget widget) {

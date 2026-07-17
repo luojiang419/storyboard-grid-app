@@ -107,14 +107,7 @@ class _AppShellState extends ConsumerState<AppShell> {
               title: widget.projectName == null
                   ? null
                   : '${AppUpdateConfig.windowTitle} — ${widget.projectName}',
-              actions: [
-                IconButton(
-                  key: const ValueKey('show-onboarding-help'),
-                  onPressed: _showOnboarding,
-                  tooltip: '新手引导',
-                  icon: const Icon(Icons.help_outline_rounded),
-                ),
-              ],
+              actions: [_OnboardingHelpAction(onPressed: _showOnboarding)],
             ),
             Expanded(
               child: Stack(
@@ -324,6 +317,45 @@ class _AppShellState extends ConsumerState<AppShell> {
 }
 
 enum _UpdateReadyAction { installNow, nextStartup }
+
+class _OnboardingHelpAction extends StatelessWidget {
+  const _OnboardingHelpAction({required this.onPressed});
+
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      key: const ValueKey('onboarding-help-action'),
+      height: 42,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '查看使用教程',
+            style: Theme.of(context).textTheme.labelMedium?.copyWith(
+              color: scheme.onSurfaceVariant,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(width: 4),
+          Icon(
+            Icons.arrow_forward_rounded,
+            size: 16,
+            color: scheme.onSurfaceVariant,
+          ),
+          IconButton(
+            key: const ValueKey('show-onboarding-help'),
+            onPressed: onPressed,
+            tooltip: '新手引导',
+            icon: const Icon(Icons.help_outline_rounded),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class _BottomTabs extends StatelessWidget {
   const _BottomTabs({

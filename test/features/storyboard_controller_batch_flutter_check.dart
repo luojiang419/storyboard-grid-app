@@ -39,6 +39,45 @@ void main() {
     expect(_itemIds(controller), ['asset-1', 'asset-4']);
   });
 
+  test('每个画板可独立撤销恢复且新操作会清空恢复栈', () async {
+    final fixture = await _createFixture();
+    final controller = fixture.controller;
+
+    controller.setGrid(2, 2);
+    controller.setGap(30);
+    expect(controller.value.selectedBoard!.gap, 30);
+
+    controller.undoSelectedBoard();
+    expect(controller.value.selectedBoard!.gap, 18);
+    expect(controller.canRedoSelectedBoard, isTrue);
+
+    controller.undoSelectedBoard();
+    expect(controller.value.selectedBoard!.rows, 3);
+    expect(controller.value.selectedBoard!.columns, 3);
+
+    controller.redoSelectedBoard();
+    expect(controller.value.selectedBoard!.rows, 2);
+    expect(controller.value.selectedBoard!.columns, 2);
+
+    controller.setResolution(1600, 0);
+    expect(controller.canRedoSelectedBoard, isFalse);
+  });
+
+  test('画板撤销历史最多保留100步', () async {
+    final fixture = await _createFixture();
+    final controller = fixture.controller;
+
+    for (var width = 1000; width <= 1100; width++) {
+      controller.setResolution(width, 0);
+    }
+    for (var step = 0; step < 100; step++) {
+      controller.undoSelectedBoard();
+    }
+
+    expect(controller.value.selectedBoard!.width, 1000);
+    expect(controller.canUndoSelectedBoard, isFalse);
+  });
+
   test('批量加选超过参数布局会自动扩容并在减选后回落', () async {
     final fixture = await _createFixture();
     final controller = fixture.controller;
@@ -1398,6 +1437,15 @@ void main() {
     expect(fixture.imageService.lastRequest?.apiKey, 'test-image-key');
     expect(controller.value.isGeneratingImage, isFalse);
     expect(controller.value.message, '图片修改完成，已替换当前格');
+
+    final generatedAssetId = first.asset.id;
+    controller.undoSelectedBoard();
+    expect(controller.value.selectedBoard!.itemAtSlot(0)!.asset.id, 'asset-1');
+    controller.redoSelectedBoard();
+    expect(
+      controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
+      generatedAssetId,
+    );
   });
 
   test('图片修改完成时目标画板已锁定不会自动替换', () async {

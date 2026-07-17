@@ -151,6 +151,12 @@ void main() {
     );
     await tester.pump();
 
+    expect(find.text('查看使用教程'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('onboarding-help-action')),
+      findsOneWidget,
+    );
+
     expect(find.byKey(const ValueKey('app-shell-bottom-tabs')), findsOneWidget);
     expect(find.text('测试工程'), findsOneWidget);
     expect(find.text('${AppUpdateConfig.windowTitle} — 测试工程'), findsOneWidget);

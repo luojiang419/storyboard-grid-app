@@ -138,7 +138,7 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
   @override
   Widget build(BuildContext context) {
     final controller = ref.watch(storyboardControllerProvider);
-    return Padding(
+    final content = Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
         children: [
@@ -296,6 +296,22 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
           ),
         ],
       ),
+    );
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.keyZ, control: true):
+            controller.undoSelectedBoard,
+        const SingleActivator(
+          LogicalKeyboardKey.keyZ,
+          control: true,
+          shift: true,
+        ): controller.redoSelectedBoard,
+        const SingleActivator(LogicalKeyboardKey.keyW, control: true):
+            controller.closeSelectedBoard,
+        const SingleActivator(LogicalKeyboardKey.tab, control: true):
+            controller.selectNextOpenBoard,
+      },
+      child: Focus(autofocus: true, child: content),
     );
   }
 
@@ -829,6 +845,15 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
         groups.isNotEmpty ||
         ungroupedFolders.isNotEmpty ||
         widget.state.resourceGroups.isNotEmpty;
+    final hasExpandableResources =
+        groups.isNotEmpty ||
+        widget.state.folders.isNotEmpty ||
+        widget.state.resourceGroups.isNotEmpty;
+    final allResourcesExpanded =
+        hasExpandableResources &&
+        groups.keys.every(_expandedSources.contains) &&
+        folderIds.every(_expandedFolders.contains) &&
+        widget.state.resourceGroups.every((group) => group.expanded);
 
     return Listener(
       onPointerSignal: _handlePointerSignal,
@@ -844,55 +869,22 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
           children: [
             Padding(
               padding: const EdgeInsets.all(14),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '裁切资源',
-                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
+              child: LayoutBuilder(
+                builder: (context, constraints) => _AssetSidebarHeader(
+                  compact: constraints.maxWidth < 340,
+                  allExpanded: allResourcesExpanded,
+                  canToggleAll: hasExpandableResources,
+                  groupModeEnabled: _groupModeEnabled,
+                  onToggleAll: () => _setAllResourcesExpanded(
+                    expanded: !allResourcesExpanded,
+                    sourceIds: groups.keys,
+                    folderIds: folderIds,
                   ),
-                  _ResourceGroupModeToggle(
-                    enabled: _groupModeEnabled,
-                    onChanged: _setGroupModeEnabled,
-                  ),
-                  const SizedBox(width: 4),
-                  IconButton(
-                    tooltip: '新建文件夹',
-                    onPressed: _createFolder,
-                    icon: const Icon(Icons.create_new_folder_rounded),
-                    iconSize: 20,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(
-                      width: 36,
-                      height: 36,
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: '刷新资源',
-                    onPressed: widget.onRefresh,
-                    icon: const Icon(Icons.refresh_rounded),
-                    iconSize: 20,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(
-                      width: 36,
-                      height: 36,
-                    ),
-                  ),
-                  IconButton(
-                    tooltip: '收起裁切资源',
-                    onPressed: widget.onCollapse,
-                    icon: const Icon(Icons.keyboard_double_arrow_left_rounded),
-                    iconSize: 20,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints.tightFor(
-                      width: 36,
-                      height: 36,
-                    ),
-                  ),
-                ],
+                  onGroupModeChanged: _setGroupModeEnabled,
+                  onCreateFolder: _createFolder,
+                  onRefresh: widget.onRefresh,
+                  onCollapse: widget.onCollapse,
+                ),
               ),
             ),
             Expanded(
@@ -1294,6 +1286,28 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     _saveUiState();
   }
 
+  void _setAllResourcesExpanded({
+    required bool expanded,
+    required Iterable<String> sourceIds,
+    required Iterable<String> folderIds,
+  }) {
+    setState(() {
+      _expandedSources
+        ..clear()
+        ..addAll(expanded ? sourceIds : const <String>[]);
+      _expandedFolders
+        ..clear()
+        ..addAll(expanded ? folderIds : const <String>[]);
+      _rangeTargetAssetId = null;
+    });
+    for (final group in widget.state.resourceGroups) {
+      if (group.expanded != expanded) {
+        widget.onToggleResourceGroupExpanded(group.id);
+      }
+    }
+    _saveUiState();
+  }
+
   bool _handleKeyEvent(KeyEvent event) {
     if (!_isShiftKey(event.logicalKey)) {
       return false;
@@ -1453,6 +1467,125 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     final start = math.min(anchorIndex, targetIndex);
     final end = math.max(anchorIndex, targetIndex);
     return visibleAssets.sublist(start, end + 1);
+  }
+}
+
+class _AssetSidebarHeader extends StatelessWidget {
+  const _AssetSidebarHeader({
+    required this.compact,
+    required this.allExpanded,
+    required this.canToggleAll,
+    required this.groupModeEnabled,
+    required this.onToggleAll,
+    required this.onGroupModeChanged,
+    required this.onCreateFolder,
+    required this.onRefresh,
+    required this.onCollapse,
+  });
+
+  final bool compact;
+  final bool allExpanded;
+  final bool canToggleAll;
+  final bool groupModeEnabled;
+  final VoidCallback onToggleAll;
+  final ValueChanged<bool> onGroupModeChanged;
+  final VoidCallback onCreateFolder;
+  final Future<void> Function() onRefresh;
+  final VoidCallback onCollapse;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = Text(
+      '裁切资源',
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: Theme.of(
+        context,
+      ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+    );
+    final toggleAll = Tooltip(
+      message: allExpanded ? '收纳全部' : '展开全部',
+      child: TextButton.icon(
+        key: const ValueKey('resource-expand-collapse-all'),
+        onPressed: canToggleAll ? onToggleAll : null,
+        icon: Icon(
+          allExpanded ? Icons.unfold_less_rounded : Icons.unfold_more_rounded,
+          size: 18,
+        ),
+        label: Text(allExpanded ? '收纳' : '展开'),
+        style: TextButton.styleFrom(
+          minimumSize: const Size(64, 36),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+        ),
+      ),
+    );
+    final actions = <Widget>[
+      _ResourceGroupModeToggle(
+        enabled: groupModeEnabled,
+        onChanged: onGroupModeChanged,
+      ),
+      const SizedBox(width: 4),
+      _CompactHeaderButton(
+        tooltip: '新建文件夹',
+        onPressed: onCreateFolder,
+        icon: Icons.create_new_folder_rounded,
+      ),
+      _CompactHeaderButton(
+        tooltip: '刷新资源',
+        onPressed: onRefresh,
+        icon: Icons.refresh_rounded,
+      ),
+      _CompactHeaderButton(
+        tooltip: '收起裁切资源',
+        onPressed: onCollapse,
+        icon: Icons.keyboard_double_arrow_left_rounded,
+      ),
+    ];
+    if (!compact) {
+      return Row(
+        children: [
+          Expanded(child: title),
+          toggleAll,
+          ...actions,
+        ],
+      );
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Expanded(child: title),
+            toggleAll,
+          ],
+        ),
+        Row(children: [const Spacer(), ...actions]),
+      ],
+    );
+  }
+}
+
+class _CompactHeaderButton extends StatelessWidget {
+  const _CompactHeaderButton({
+    required this.tooltip,
+    required this.onPressed,
+    required this.icon,
+  });
+
+  final String tooltip;
+  final VoidCallback onPressed;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      tooltip: tooltip,
+      onPressed: onPressed,
+      icon: Icon(icon),
+      iconSize: 20,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+    );
   }
 }
 
