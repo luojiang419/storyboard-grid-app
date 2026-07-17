@@ -1,0 +1,4205 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/painting.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
+import 'package:uuid/uuid.dart';
+
+import '../../../core/providers/app_providers.dart';
+import '../../../core/database/app_database.dart';
+import '../../../core/services/empty_directory_cleaner.dart';
+import '../../../core/services/workspace_snapshot_save_queue.dart';
+import '../../../core/services/workspace_directories.dart';
+import '../../grid_cut/application/grid_cut_controller.dart';
+import '../../projects/data/project_path_resolver.dart';
+import '../../settings/application/settings_controller.dart';
+import '../data/image_generation_service.dart';
+import '../data/image_generation_diagnostic_logger.dart';
+import '../domain/image_generation_provider_resolver.dart';
+import '../data/vision_run_logger.dart';
+import '../data/vision_storyboard_service.dart';
+import '../domain/storyboard_models.dart';
+
+final storyboardControllerProvider = Provider<StoryboardController>(
+  (ref) {
+    final controller = StoryboardController(
+      database: ref.watch(appDatabaseProvider),
+      directories: ref.watch(projectDirectoriesProvider),
+      settingsController: ref.watch(settingsControllerProvider),
+    );
+    unawaited(controller.refreshAssets());
+    final cutResultsChangeNotifier = ref.watch(
+      cutResultsChangeNotifierProvider,
+    );
+    void handleCutResultsChanged() {
+      controller.handleCutResultsChanged();
+    }
+
+    cutResultsChangeNotifier.addListener(handleCutResultsChanged);
+    ref.onDispose(() {
+      cutResultsChangeNotifier.removeListener(handleCutResultsChanged);
+      controller.dispose();
+    });
+    return controller;
+  },
+  dependencies: [
+    appDatabaseProvider,
+    projectDirectoriesProvider,
+    cutResultsChangeNotifierProvider,
+  ],
+);
+
+class StoryboardController extends ValueNotifier<StoryboardState> {
+  StoryboardController({
+    required AppDatabase database,
+    WorkspaceDirectories? directories,
+    SettingsController? settingsController,
+    VisionStoryboardService? visionService,
+    ImageGenerationService? imageGenerationService,
+  }) : _database = database,
+       _directories = directories,
+       _pathResolver = directories == null
+           ? null
+           : ProjectPathResolver(directories.workspaceRoot),
+       _settingsController = settingsController,
+       _visionService = visionService ?? VisionStoryboardService(),
+       _imageGenerationService =
+           imageGenerationService ??
+           ImageGenerationService(
+             diagnosticLogger: directories == null
+                 ? null
+                 : ImageGenerationDiagnosticLogger(directories.logs),
+           ),
+       _visionLogger = directories == null
+           ? null
+           : VisionRunLogger(directories.logs),
+       _ownsVisionService = visionService == null,
+       _ownsImageGenerationService = imageGenerationService == null,
+       super(const StoryboardState.initial()) {
+    _workspaceSaveQueue = WorkspaceSnapshotSaveQueue(
+      buildSnapshot: () => jsonEncode(_workspaceSnapshotToJson(value)),
+      writeSnapshot: (snapshot) =>
+          _database.setSetting(_workspaceSnapshotKey, snapshot),
+    );
+    _selectionSaveQueue = WorkspaceSnapshotSaveQueue(
+      buildSnapshot: () => value.selectedBoardId ?? '',
+      writeSnapshot: (selection) =>
+          _database.setSetting(_selectionStateKey, selection),
+    );
+    _restoreWorkspaceOrCreateDefault();
+  }
+
+  static const _workspaceSnapshotKey = 'storyboardWorkspaceSnapshot';
+  static const _selectionStateKey = 'storyboardWorkspaceSelection';
+  static const _workspaceSnapshotVersion = 2;
+  static const _maxGridExtent = 12;
+
+  final AppDatabase _database;
+  final WorkspaceDirectories? _directories;
+  final ProjectPathResolver? _pathResolver;
+  final SettingsController? _settingsController;
+  final VisionStoryboardService _visionService;
+  final ImageGenerationService _imageGenerationService;
+  final VisionRunLogger? _visionLogger;
+  final bool _ownsVisionService;
+  final bool _ownsImageGenerationService;
+  final _uuid = const Uuid();
+  late final WorkspaceSnapshotSaveQueue _workspaceSaveQueue;
+  late final WorkspaceSnapshotSaveQueue _selectionSaveQueue;
+  Future<void>? _assetRefreshFuture;
+  bool _assetRefreshPending = false;
+  String? _pendingAssetRefreshMessage;
+  bool _pendingAssetCacheEviction = false;
+  var _assetFileSignatures = <String, _AssetFileSignature>{};
+  bool _disposed = false;
+  var _visionOperationToken = 0;
+  var _visionCancelRequested = false;
+  final _visionTaskQueue = <_QueuedVisionTask>[];
+  _QueuedVisionTask? _activeVisionTask;
+  var _visionQueueRunning = false;
+
+  @override
+  void dispose() {
+    _disposed = true;
+    _workspaceSaveQueue.dispose();
+    _selectionSaveQueue.dispose();
+    if (_ownsVisionService) {
+      _visionService.close();
+    }
+    if (_ownsImageGenerationService) {
+      _imageGenerationService.close();
+    }
+    super.dispose();
+  }
+
+  void cancelVisionAnalysis() {
+    if (!value.isAnalyzing || value.isCancellingAnalysis) {
+      return;
+    }
+    _visionCancelRequested = true;
+    _visionOperationToken++;
+    _visionService.cancelActiveRequests();
+    value = value.copyWith(
+      isCancellingAnalysis: true,
+      message: '正在取消当前视觉任务...',
+    );
+    unawaited(_logVisionEvent('cancel_requested', const {}));
+  }
+
+  int _beginVisionOperation() {
+    _visionCancelRequested = false;
+    _visionOperationToken++;
+    return _visionOperationToken;
+  }
+
+  bool _isVisionOperationCancelled(int token) {
+    return _visionCancelRequested || token != _visionOperationToken;
+  }
+
+  Future<void> _finishCancelledVisionOperation(
+    int token, {
+    required String message,
+    String? runId,
+  }) async {
+    _visionCancelRequested = false;
+    final details = <String, Object?>{'token': token, 'message': message};
+    if (runId != null) {
+      details['runId'] = runId;
+    }
+    await _logVisionEvent('cancelled', details);
+    value = value.copyWith(
+      isAnalyzing: false,
+      isCancellingAnalysis: false,
+      message: message,
+    );
+  }
+
+  Future<void> _logVisionEvent(
+    String event,
+    Map<String, Object?> details,
+  ) async {
+    final logger = _visionLogger;
+    if (logger == null) {
+      return;
+    }
+    await logger.write(event, details);
+  }
+
+  String _visionLogPreview(String value) {
+    final compact = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (compact.length <= 1000) {
+      return compact;
+    }
+    return '${compact.substring(0, 1000)}...';
+  }
+
+  Future<void> _enqueueVisionTask(StoryboardVisionTask task) {
+    final activeTask = _activeVisionTask;
+    if (activeTask != null && activeTask.task.sameTarget(task)) {
+      value = value.copyWith(message: _visionTaskAlreadyRunningMessage(task));
+      return activeTask.completer.future;
+    }
+    for (final queuedTask in _visionTaskQueue) {
+      if (queuedTask.task.sameTarget(task)) {
+        value = value.copyWith(message: _visionTaskAlreadyQueuedMessage(task));
+        return queuedTask.completer.future;
+      }
+    }
+
+    final queuedTask = _QueuedVisionTask(task);
+    _visionTaskQueue.add(queuedTask);
+    _syncVisionTaskState(
+      isAnalyzing: true,
+      isCancellingAnalysis: false,
+      message: _activeVisionTask == null
+          ? _visionTaskStartingMessage(task)
+          : _visionTaskQueuedMessage(task),
+    );
+    unawaited(_runVisionTaskQueue());
+    return queuedTask.completer.future;
+  }
+
+  Future<void> _runVisionTaskQueue() async {
+    if (_visionQueueRunning) {
+      return;
+    }
+    _visionQueueRunning = true;
+    try {
+      while (_visionTaskQueue.isNotEmpty) {
+        final queuedTask = _visionTaskQueue.removeAt(0);
+        _activeVisionTask = queuedTask;
+        _syncVisionTaskState(
+          isAnalyzing: true,
+          isCancellingAnalysis: false,
+          message: _visionTaskStartingMessage(queuedTask.task),
+        );
+        final operationToken = _beginVisionOperation();
+        try {
+          await _runVisionTask(queuedTask.task, operationToken);
+        } catch (error) {
+          value = value.copyWith(
+            isAnalyzing: false,
+            isCancellingAnalysis: false,
+            message: '视觉任务失败：$error',
+          );
+        } finally {
+          if (!queuedTask.completer.isCompleted) {
+            queuedTask.completer.complete();
+          }
+          if (identical(_activeVisionTask, queuedTask)) {
+            _activeVisionTask = null;
+          }
+          _syncVisionTaskState(
+            isAnalyzing: _visionTaskQueue.isNotEmpty,
+            isCancellingAnalysis: false,
+          );
+        }
+      }
+    } finally {
+      _visionQueueRunning = false;
+      _activeVisionTask = null;
+      _syncVisionTaskState(isAnalyzing: false, isCancellingAnalysis: false);
+    }
+  }
+
+  Future<void> _runVisionTask(
+    StoryboardVisionTask task,
+    int operationToken,
+  ) async {
+    switch (task.kind) {
+      case StoryboardVisionTaskKind.analyze:
+        _database.deleteVisionAnalysisForBoard(task.boardId);
+        await _analyzeBoardWithVision(
+          boardId: task.boardId,
+          operationToken: operationToken,
+        );
+        return;
+      case StoryboardVisionTaskKind.reorder:
+        await _reorderBoardByVisionAnalysis(
+          boardId: task.boardId,
+          operationToken: operationToken,
+        );
+        return;
+    }
+  }
+
+  void _syncVisionTaskState({
+    bool? isAnalyzing,
+    bool? isCancellingAnalysis,
+    String? message,
+  }) {
+    final activeTask = _activeVisionTask?.task;
+    value = value.copyWith(
+      isAnalyzing: isAnalyzing ?? (activeTask != null),
+      isCancellingAnalysis: isCancellingAnalysis,
+      activeVisionBoardId: activeTask?.boardId,
+      activeVisionTaskKind: activeTask?.kind,
+      queuedVisionTasks: [
+        for (final queuedTask in _visionTaskQueue) queuedTask.task,
+      ],
+      message: message,
+    );
+  }
+
+  String _visionTaskStartingMessage(StoryboardVisionTask task) {
+    return switch (task.kind) {
+      StoryboardVisionTaskKind.analyze => '正在启动自动解析...',
+      StoryboardVisionTaskKind.reorder => '正在启动自动重排序...',
+    };
+  }
+
+  String _visionTaskQueuedMessage(StoryboardVisionTask task) {
+    return switch (task.kind) {
+      StoryboardVisionTaskKind.analyze => '已加入自动解析队列',
+      StoryboardVisionTaskKind.reorder => '已加入自动重排序队列',
+    };
+  }
+
+  String _visionTaskAlreadyRunningMessage(StoryboardVisionTask task) {
+    return switch (task.kind) {
+      StoryboardVisionTaskKind.analyze => '当前画板正在自动解析',
+      StoryboardVisionTaskKind.reorder => '当前画板正在自动重排序',
+    };
+  }
+
+  String _visionTaskAlreadyQueuedMessage(StoryboardVisionTask task) {
+    return switch (task.kind) {
+      StoryboardVisionTaskKind.analyze => '当前画板已在自动解析队列中',
+      StoryboardVisionTaskKind.reorder => '当前画板已在自动重排序队列中',
+    };
+  }
+
+  Future<void> refreshAssets() {
+    return _reloadAssets();
+  }
+
+  void handleCutResultsChanged() {
+    unawaited(
+      _reloadAssets(
+        message: '裁切结果已更新，资源已刷新',
+        evictImageCache: true,
+        ensureLatest: true,
+      ),
+    );
+  }
+
+  Future<void> createFolder(String name) async {
+    final root = _directories?.storyboardFolders;
+    if (root == null) {
+      value = value.copyWith(message: '数据目录尚未初始化，无法创建文件夹');
+      return;
+    }
+    if (!root.existsSync()) {
+      await root.create(recursive: true);
+    }
+    final safeName = _safeFolderName(name);
+    final folderName = _uniqueFolderName(root, safeName);
+    final folder = Directory(p.join(root.path, folderName));
+    await folder.create(recursive: true);
+    await _reloadAssets(message: '已创建文件夹 $folderName', ensureLatest: true);
+  }
+
+  Future<void> copyAssetToFolder({
+    required StoryboardCutAsset asset,
+    required String folderId,
+  }) async {
+    final folder = _folderDirectory(folderId);
+    if (folder == null) {
+      value = value.copyWith(message: '目标文件夹不存在，请刷新后重试');
+      return;
+    }
+    final source = File(asset.path);
+    if (!source.existsSync() || !_isSupportedImage(source.path)) {
+      await _reloadAssets(message: '图片文件不存在，已刷新资源状态', ensureLatest: true);
+      return;
+    }
+    final copied = await _copyImageFileToFolder(source, folder);
+    if (copied == null) {
+      value = value.copyWith(message: '图片已在 ${p.basename(folder.path)} 中');
+      return;
+    }
+    await _reloadAssets(
+      message: '已保存图片到 ${p.basename(folder.path)}',
+      ensureLatest: true,
+    );
+  }
+
+  Future<void> copyPathsToFolder({
+    required Iterable<String> paths,
+    required String folderId,
+  }) async {
+    final folder = _folderDirectory(folderId);
+    if (folder == null) {
+      value = value.copyWith(message: '目标文件夹不存在，请刷新后重试');
+      return;
+    }
+    final imagePaths = paths.where(_isSupportedImage).toList();
+    if (imagePaths.isEmpty) {
+      value = value.copyWith(message: '未发现支持的图片文件');
+      return;
+    }
+
+    var copiedCount = 0;
+    var existingCount = 0;
+    for (final imagePath in imagePaths) {
+      final source = File(imagePath);
+      if (!source.existsSync()) {
+        continue;
+      }
+      final copied = await _copyImageFileToFolder(source, folder);
+      if (copied == null) {
+        existingCount++;
+      } else {
+        copiedCount++;
+      }
+    }
+
+    final folderName = p.basename(folder.path);
+    if (copiedCount == 0 && existingCount > 0) {
+      value = value.copyWith(message: '图片已在 $folderName 中');
+      return;
+    }
+    await _reloadAssets(
+      message: '已保存 $copiedCount 张图片到 $folderName',
+      ensureLatest: true,
+    );
+  }
+
+  Future<void> createResourceGroup({
+    required String name,
+    Iterable<String> assetIds = const [],
+    Iterable<String> sourceImageIds = const [],
+    Iterable<String> folderIds = const [],
+  }) async {
+    final validAssetIds = {
+      for (final asset in value.assets) asset.id,
+      for (final folder in value.folders)
+        for (final asset in folder.assets) asset.id,
+    };
+    final validSourceImageIds = {
+      for (final asset in value.assets) asset.imageId,
+    };
+    final validFolderIds = {for (final folder in value.folders) folder.id};
+    final nextAssetIds = [
+      for (final assetId in assetIds.toSet())
+        if (validAssetIds.contains(assetId)) assetId,
+    ];
+    final nextSourceImageIds = [
+      for (final sourceImageId in sourceImageIds.toSet())
+        if (validSourceImageIds.contains(sourceImageId)) sourceImageId,
+    ];
+    final nextFolderIds = [
+      for (final folderId in folderIds.toSet())
+        if (validFolderIds.contains(folderId)) folderId,
+    ];
+    if (nextAssetIds.isEmpty &&
+        nextSourceImageIds.isEmpty &&
+        nextFolderIds.isEmpty) {
+      value = value.copyWith(message: '请先选择要编组的裁切资源');
+      return;
+    }
+
+    final safeName = _safeFolderName(name);
+    final groupName = _uniqueResourceGroupName(safeName);
+    final movingSourceIds = nextSourceImageIds.toSet();
+    final movingFolderIds = nextFolderIds.toSet();
+    final movingAssetIds = {
+      ...nextAssetIds,
+      for (final asset in value.assets)
+        if (movingSourceIds.contains(asset.imageId)) asset.id,
+      for (final folder in value.folders)
+        if (movingFolderIds.contains(folder.id))
+          for (final asset in folder.assets) asset.id,
+    };
+    final groups = [
+      for (final group in value.resourceGroups)
+        _resourceGroupWithout(
+          group,
+          assetIds: movingAssetIds,
+          sourceImageIds: movingSourceIds,
+          folderIds: movingFolderIds,
+        ),
+    ].where((group) => !group.isEmpty).toList();
+    groups.add(
+      StoryboardResourceGroup(
+        id: _uuid.v4(),
+        name: groupName,
+        assetIds: nextAssetIds,
+        sourceImageIds: nextSourceImageIds,
+        folderIds: nextFolderIds,
+      ),
+    );
+    _setState(
+      value.copyWith(resourceGroups: groups, message: '已创建裁切资源编组 $groupName'),
+    );
+  }
+
+  void toggleResourceGroupExpanded(String groupId) {
+    _setState(
+      value.copyWith(
+        resourceGroups: [
+          for (final group in value.resourceGroups)
+            if (group.id == groupId)
+              group.copyWith(expanded: !group.expanded)
+            else
+              group,
+        ],
+      ),
+    );
+  }
+
+  Future<void> _reloadAssets({
+    String? message,
+    bool evictImageCache = false,
+    bool ensureLatest = false,
+  }) {
+    if (_disposed) {
+      return Future.value();
+    }
+
+    final activeRefresh = _assetRefreshFuture;
+    if (activeRefresh != null) {
+      if (ensureLatest) {
+        _queueAssetRefresh(message, evictImageCache);
+      }
+      return activeRefresh;
+    }
+
+    _queueAssetRefresh(message, evictImageCache);
+    final completer = Completer<void>();
+    _assetRefreshFuture = completer.future;
+    unawaited(_drainAssetRefreshQueue(completer));
+    return completer.future;
+  }
+
+  void _queueAssetRefresh(String? message, bool evictImageCache) {
+    _assetRefreshPending = true;
+    _pendingAssetRefreshMessage = message;
+    _pendingAssetCacheEviction |= evictImageCache;
+  }
+
+  Future<void> _drainAssetRefreshQueue(Completer<void> completer) async {
+    try {
+      while (_assetRefreshPending && !_disposed) {
+        final message = _pendingAssetRefreshMessage;
+        final evictImageCache = _pendingAssetCacheEviction;
+        _assetRefreshPending = false;
+        _pendingAssetRefreshMessage = null;
+        _pendingAssetCacheEviction = false;
+        await _performAssetRefresh(
+          message: message,
+          evictImageCache: evictImageCache,
+        );
+      }
+      completer.complete();
+    } catch (error, stackTrace) {
+      completer.completeError(error, stackTrace);
+    } finally {
+      _assetRefreshFuture = null;
+    }
+  }
+
+  Future<void> _performAssetRefresh({
+    required String? message,
+    required bool evictImageCache,
+  }) async {
+    final records = _database.listCutResults();
+    final scanRequest = _AssetScanRequest(
+      cutResults: [
+        for (final record in records)
+          _AssetScanEntry(id: record.id, path: _toRuntimePath(record.path)),
+      ],
+      storyboardFoldersPath: _directories?.storyboardFolders.path,
+      cutsPath: _directories?.cuts.path,
+    );
+    final scanResult = await compute(
+      _scanStoryboardAssets,
+      scanRequest,
+      debugLabel: 'storyboard-asset-refresh',
+    );
+    if (_disposed) {
+      return;
+    }
+
+    final deleted = _database.deleteCutResultsByIds(scanResult.missingIds);
+    final assets = _database
+        .listCutResults()
+        .map(
+          (record) => StoryboardCutAsset(
+            id: record.id,
+            imageId: record.imageId,
+            sourceName: record.originalName,
+            path: _toRuntimePath(record.path),
+            indexNo: record.indexNo,
+          ),
+        )
+        .toList();
+    final folders = _foldersFromScan(scanResult.folders);
+    final resourceGroups = _pruneResourceGroups(
+      value.resourceGroups,
+      assets,
+      folders,
+    );
+    if (evictImageCache) {
+      _evictFileImageCache(
+        changedStoryboardAssetImagePaths(
+          _assetFileSignatures,
+          scanResult.fileSignatures,
+        ),
+      );
+    }
+    _assetFileSignatures = scanResult.fileSignatures;
+    final validIds = {
+      for (final asset in assets) asset.id,
+      for (final folder in folders)
+        for (final asset in folder.assets) asset.id,
+    };
+    _setState(
+      value.copyWith(
+        assets: assets,
+        folders: folders,
+        resourceGroups: resourceGroups,
+        boards: _removeMissingItemsFromBoards(value.boards, validIds),
+        message:
+            message ??
+            _assetRefreshMessage(
+              assets,
+              folders,
+              deleted,
+              scanResult.cleanedEmptyDirectories,
+            ),
+      ),
+    );
+  }
+
+  List<StoryboardFolder> _foldersFromScan(
+    List<_ScannedStoryboardFolder> scannedFolders,
+  ) {
+    return [
+      for (final folder in scannedFolders)
+        StoryboardFolder(
+          id: folder.id,
+          name: folder.name,
+          path: folder.path,
+          assets: [
+            for (var index = 0; index < folder.files.length; index++)
+              StoryboardCutAsset(
+                id: 'folder:${folder.id}:${p.basename(folder.files[index])}',
+                imageId: 'folder:${folder.id}',
+                sourceName: folder.name,
+                path: folder.files[index],
+                indexNo: index + 1,
+              ),
+          ],
+        ),
+    ];
+  }
+
+  void _evictFileImageCache(Iterable<String> paths) {
+    for (final path in paths) {
+      if (path.trim().isEmpty) {
+        continue;
+      }
+      unawaited(FileImage(File(path)).evict());
+    }
+  }
+
+  void deleteAssetGroup(String imageId) {
+    final assets = value.assets
+        .where((asset) => asset.imageId == imageId)
+        .toList();
+    if (assets.isEmpty) {
+      return;
+    }
+
+    var deletedFiles = 0;
+    for (final asset in assets) {
+      final file = File(asset.path);
+      if (file.existsSync()) {
+        try {
+          file.deleteSync();
+          deletedFiles++;
+        } on FileSystemException {
+          // 数据库记录仍会删除，避免界面残留无法使用的资源。
+        }
+      }
+    }
+
+    _database.deleteCutResultsForImage(imageId);
+    final cleanedEmptyDirectories = _cleanEmptyCutDirectories();
+    final deletedIds = assets.map((asset) => asset.id).toSet();
+    _setState(
+      value.copyWith(
+        assets: value.assets
+            .where((asset) => asset.imageId != imageId)
+            .toList(),
+        resourceGroups: _pruneResourceGroups(
+          value.resourceGroups,
+          value.assets.where((asset) => asset.imageId != imageId).toList(),
+          value.folders,
+        ),
+        boards: [
+          for (final board in value.boards)
+            _boardWithAdaptiveHeight(
+              board.copyWith(
+                items: board.items
+                    .where((item) => !deletedIds.contains(item.asset.id))
+                    .toList(),
+              ),
+            ),
+        ],
+        message:
+            '已删除 ${assets.length} 张裁切资源，清理 $deletedFiles 个文件'
+            '${cleanedEmptyDirectories > 0 ? '，清理 $cleanedEmptyDirectories 个空文件夹' : ''}',
+      ),
+    );
+  }
+
+  Future<void> deleteFolderAsset(StoryboardCutAsset asset) async {
+    StoryboardFolder? matchedFolder;
+    StoryboardCutAsset? matchedAsset;
+    for (final folder in value.folders) {
+      for (final folderAsset in folder.assets) {
+        if (folderAsset.id == asset.id) {
+          matchedFolder = folder;
+          matchedAsset = folderAsset;
+          break;
+        }
+      }
+      if (matchedAsset != null) {
+        break;
+      }
+    }
+
+    if (matchedFolder == null || matchedAsset == null) {
+      await _reloadAssets(message: '图片文件不存在，已刷新资源状态', ensureLatest: true);
+      return;
+    }
+
+    final file = File(matchedAsset.path);
+    if (!file.existsSync()) {
+      await _reloadAssets(message: '图片文件不存在，已刷新资源状态', ensureLatest: true);
+      return;
+    }
+
+    try {
+      await file.delete();
+    } on FileSystemException {
+      value = value.copyWith(message: '删除图片失败，请确认文件未被占用');
+      return;
+    }
+
+    await _reloadAssets(
+      message: '已删除 ${matchedFolder.name} 中的图片',
+      evictImageCache: true,
+      ensureLatest: true,
+    );
+  }
+
+  void addBoard() {
+    final index = value.boards.length + 1;
+    final board = _newBoard(index);
+    _setState(
+      value.copyWith(
+        boards: [...value.boards, board],
+        openBoardIds: [...value.openBoardIds, board.id],
+        selectedBoardId: board.id,
+        message: '已创建 ${board.name}',
+      ),
+    );
+  }
+
+  void closeBoard(String boardId) {
+    final index = value.openBoardIds.indexOf(boardId);
+    if (index < 0) {
+      return;
+    }
+    final nextOpenBoardIds = [
+      for (final id in value.openBoardIds)
+        if (id != boardId) id,
+    ];
+    var selectedBoardId = value.selectedBoardId;
+    if (selectedBoardId == boardId) {
+      selectedBoardId = nextOpenBoardIds.isEmpty
+          ? null
+          : nextOpenBoardIds[index
+                .clamp(0, nextOpenBoardIds.length - 1)
+                .toInt()];
+    }
+    final board = value.boards.cast<StoryboardBoard?>().firstWhere(
+      (item) => item?.id == boardId,
+      orElse: () => null,
+    );
+    _setState(
+      value.copyWith(
+        openBoardIds: nextOpenBoardIds,
+        selectedBoardId: selectedBoardId,
+        message: board == null ? value.message : '已关闭 ${board.name} 的页签',
+      ),
+    );
+  }
+
+  void openBoard(String boardId) {
+    final board = value.boards.cast<StoryboardBoard?>().firstWhere(
+      (item) => item?.id == boardId,
+      orElse: () => null,
+    );
+    if (board == null) {
+      return;
+    }
+    final nextOpenBoardIds = value.openBoardIds.contains(boardId)
+        ? value.openBoardIds
+        : [...value.openBoardIds, boardId];
+    _setState(
+      value.copyWith(
+        openBoardIds: nextOpenBoardIds,
+        selectedBoardId: boardId,
+        message: '已打开 ${board.name}',
+      ),
+    );
+  }
+
+  String? createBoardGroup(String name) {
+    final normalizedName = name.trim();
+    if (normalizedName.isEmpty) {
+      value = value.copyWith(message: '编组名称不能为空');
+      return null;
+    }
+    if (_boardGroupNameExists(normalizedName)) {
+      value = value.copyWith(message: '已存在同名画板编组');
+      return null;
+    }
+    final group = StoryboardBoardGroup(id: _uuid.v4(), name: normalizedName);
+    _setState(
+      value.copyWith(
+        boardGroups: [...value.boardGroups, group],
+        message: '已创建画板编组 ${group.name}',
+      ),
+    );
+    return group.id;
+  }
+
+  void renameBoardGroup(String groupId, String name) {
+    final normalizedName = name.trim();
+    if (normalizedName.isEmpty) {
+      value = value.copyWith(message: '编组名称不能为空');
+      return;
+    }
+    final index = value.boardGroups.indexWhere((group) => group.id == groupId);
+    if (index < 0) {
+      return;
+    }
+    if (_boardGroupNameExists(normalizedName, excludingId: groupId)) {
+      value = value.copyWith(message: '已存在同名画板编组');
+      return;
+    }
+    final previous = value.boardGroups[index];
+    _setState(
+      value.copyWith(
+        boardGroups: [
+          for (final group in value.boardGroups)
+            if (group.id == groupId)
+              group.copyWith(name: normalizedName)
+            else
+              group,
+        ],
+        message: '已将 ${previous.name} 重命名为 $normalizedName',
+      ),
+    );
+  }
+
+  void deleteBoardGroup(String groupId) {
+    final group = value.boardGroups.cast<StoryboardBoardGroup?>().firstWhere(
+      (item) => item?.id == groupId,
+      orElse: () => null,
+    );
+    if (group == null) {
+      return;
+    }
+    _setState(
+      value.copyWith(
+        boardGroups: [
+          for (final item in value.boardGroups)
+            if (item.id != groupId) item,
+        ],
+        boards: [
+          for (final board in value.boards)
+            if (board.groupId == groupId)
+              board.copyWith(groupId: null)
+            else
+              board,
+        ],
+        message: '已删除编组 ${group.name}，画板已移至未编组',
+      ),
+    );
+  }
+
+  void assignBoardsToGroup(Iterable<String> boardIds, String? groupId) {
+    final ids = boardIds.toSet();
+    if (ids.isEmpty) {
+      return;
+    }
+    if (groupId != null &&
+        !value.boardGroups.any((group) => group.id == groupId)) {
+      value = value.copyWith(message: '目标画板编组不存在');
+      return;
+    }
+    _setState(
+      value.copyWith(
+        boards: [
+          for (final board in value.boards)
+            if (ids.contains(board.id))
+              board.copyWith(groupId: groupId)
+            else
+              board,
+        ],
+        message: groupId == null
+            ? '已将 ${ids.length} 个画板移出编组'
+            : '已移动 ${ids.length} 个画板到编组',
+      ),
+    );
+  }
+
+  bool _boardGroupNameExists(String name, {String? excludingId}) {
+    final normalized = name.trim().toLowerCase();
+    return value.boardGroups.any(
+      (group) =>
+          group.id != excludingId &&
+          group.name.trim().toLowerCase() == normalized,
+    );
+  }
+
+  void deleteBoard(String boardId) {
+    if (value.boards.length <= 1) {
+      value = value.copyWith(message: '至少保留一个画板');
+      return;
+    }
+    final index = value.boards.indexWhere((board) => board.id == boardId);
+    if (index < 0) {
+      return;
+    }
+    final deletedBoard = value.boards[index];
+    if (_guardLockedBoard(deletedBoard, '删除画板')) {
+      return;
+    }
+    final nextBoards = [
+      for (final board in value.boards)
+        if (board.id != boardId) board,
+    ];
+    final deletedOpenIndex = value.openBoardIds.indexOf(boardId);
+    final nextOpenBoardIds = [
+      for (final id in value.openBoardIds)
+        if (id != boardId) id,
+    ];
+    String? selectedBoardId = value.selectedBoardId;
+    if (selectedBoardId == boardId ||
+        (selectedBoardId != null &&
+            !nextOpenBoardIds.contains(selectedBoardId))) {
+      selectedBoardId = nextOpenBoardIds.isEmpty
+          ? null
+          : nextOpenBoardIds[deletedOpenIndex
+                .clamp(0, nextOpenBoardIds.length - 1)
+                .toInt()];
+    }
+    _setState(
+      value.copyWith(
+        boards: nextBoards,
+        openBoardIds: nextOpenBoardIds,
+        selectedBoardId: selectedBoardId,
+        message: '已删除 ${deletedBoard.name}',
+      ),
+    );
+  }
+
+  void selectBoard(String boardId) {
+    if (!value.openBoardIds.contains(boardId)) {
+      return;
+    }
+    _setState(value.copyWith(selectedBoardId: boardId), saveWorkspace: false);
+  }
+
+  void toggleSelectedBoardLock() {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    final locked = !board.locked;
+    _replaceBoard(
+      board.copyWith(locked: locked),
+      message: locked ? '${board.name} 已锁定' : '${board.name} 已解锁',
+    );
+  }
+
+  bool _guardLockedBoard(StoryboardBoard board, String action) {
+    if (!board.locked) {
+      return false;
+    }
+    value = value.copyWith(message: '${board.name} 已锁定，请先解锁后再$action');
+    return true;
+  }
+
+  void renameSelectedBoard(String name) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '重命名画板')) {
+      return;
+    }
+    final nextName = name.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (nextName.isEmpty) {
+      value = value.copyWith(message: '画板名称不能为空');
+      return;
+    }
+    if (nextName == board.name) {
+      return;
+    }
+    _replaceBoard(board.copyWith(name: nextName), message: '已重命名为 $nextName');
+  }
+
+  void clearSelectedBoard() {
+    if (value.isAnalyzing) {
+      value = value.copyWith(message: '正在解析故事板，暂不能清空当前画板');
+      return;
+    }
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '清空画板')) {
+      return;
+    }
+    _replaceBoard(
+      _boardWithAdaptiveHeight(
+        board.copyWith(
+          items: const [],
+          rowCaptions: _emptyRowCaptions(board.rows),
+          clearSummary: true,
+        ),
+      ),
+      message: '已清空 ${board.name}',
+    );
+  }
+
+  void addOrRemoveAsset(StoryboardCutAsset asset) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '添加或移除图片')) {
+      return;
+    }
+    final exists = board.items.any((item) => item.asset.id == asset.id);
+    if (exists) {
+      removeAsset(asset.id);
+      return;
+    }
+    final compactBoard = _compactBoardItems(board);
+    final nextSlotIndex = compactBoard.visibleItemCount;
+    if (nextSlotIndex >= _maxSlotCount) {
+      value = value.copyWith(message: '当前画板宫格已达上限');
+      return;
+    }
+    final nextItems = [
+      ...compactBoard.items,
+      StoryboardItem(asset: asset, caption: '', slotIndex: nextSlotIndex),
+    ];
+    final nextBoard = _boardWithGridForItemCount(
+      compactBoard.copyWith(items: nextItems),
+      itemCount: nextItems.length,
+    );
+    _replaceBoard(
+      nextBoard,
+      message: '已添加 ${asset.sourceName}${asset.indexNo}',
+    );
+  }
+
+  void placeAssetAtSlot(StoryboardCutAsset asset, int slotIndex) {
+    final board = value.selectedBoard;
+    if (board == null || slotIndex < 0 || slotIndex >= board.slotCount) {
+      return;
+    }
+    if (_guardLockedBoard(board, '放入图片')) {
+      return;
+    }
+    final compactBoard = _compactBoardItems(board);
+    StoryboardItem? existingItem;
+    for (final item in compactBoard.items) {
+      if (item.asset.id == asset.id) {
+        existingItem = item;
+        break;
+      }
+    }
+    if (existingItem != null) {
+      moveItem(existingItem.slotIndex, slotIndex);
+      return;
+    }
+    final items = [...compactBoard.items]
+      ..sort((a, b) => a.slotIndex.compareTo(b.slotIndex));
+    if (items.length >= _maxSlotCount) {
+      value = value.copyWith(message: '当前画板宫格已达上限');
+      return;
+    }
+    final target = slotIndex.clamp(0, compactBoard.slotCount - 1).toInt();
+    final insertIndex = target.clamp(0, items.length).toInt();
+    items.insert(
+      insertIndex,
+      StoryboardItem(asset: asset, caption: '', slotIndex: insertIndex),
+    );
+    for (var i = 0; i < items.length; i++) {
+      items[i] = items[i].copyWith(slotIndex: i);
+    }
+    final nextBoard = _boardWithGridForItemCount(
+      compactBoard.copyWith(items: items),
+      itemCount: items.length,
+    );
+    _replaceBoard(
+      nextBoard,
+      message: '已放入 ${asset.sourceName}${asset.indexNo}',
+    );
+  }
+
+  void setAssetsUsed(Iterable<StoryboardCutAsset> assets, bool used) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, used ? '批量添加图片' : '批量移除图片')) {
+      return;
+    }
+    final selectedAssets = assets.toList();
+    if (selectedAssets.isEmpty) {
+      return;
+    }
+    if (used) {
+      final compactBoard = _compactBoardItems(board);
+      final usedIds = compactBoard.items.map((item) => item.asset.id).toSet();
+      final nextItems = [...compactBoard.items];
+      var added = 0;
+      var skippedForFull = false;
+      for (final asset in selectedAssets) {
+        if (usedIds.add(asset.id)) {
+          if (nextItems.length >= _maxSlotCount) {
+            skippedForFull = true;
+            break;
+          }
+          nextItems.add(
+            StoryboardItem(
+              asset: asset,
+              caption: '',
+              slotIndex: nextItems.length,
+            ),
+          );
+          added++;
+        }
+      }
+      final nextBoard = _boardWithGridForItemCount(
+        compactBoard.copyWith(items: nextItems),
+        itemCount: nextItems.length,
+      );
+      _replaceBoard(
+        nextBoard,
+        message: added == 0
+            ? skippedForFull
+                  ? '当前画板宫格已达上限'
+                  : '所选图片已在画板中'
+            : skippedForFull
+            ? '已批量添加 $added 张图片，当前画板宫格已达上限'
+            : '已批量添加 $added 张图片',
+      );
+      return;
+    }
+
+    final targetIds = selectedAssets.map((asset) => asset.id).toSet();
+    final nextItems = board.items
+        .where((item) => !targetIds.contains(item.asset.id))
+        .toList();
+    final removed = board.items.length - nextItems.length;
+    final nextBoard = _boardWithGridForItemCount(
+      board.copyWith(items: nextItems),
+      itemCount: nextItems.length,
+    );
+    _replaceBoard(
+      nextBoard,
+      message: removed == 0 ? '所选图片未在画板中' : '已批量移除 $removed 张图片',
+    );
+  }
+
+  void removeAsset(String assetId) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '移除图片')) {
+      return;
+    }
+    final nextItems = board.items
+        .where((item) => item.asset.id != assetId)
+        .toList();
+    final nextBoard = _boardWithGridForItemCount(
+      board.copyWith(items: nextItems),
+      itemCount: nextItems.length,
+    );
+    _replaceBoard(nextBoard, message: '已移除图片');
+  }
+
+  void moveItem(int from, int to) {
+    final board = value.selectedBoard;
+    if (board == null || from == to || from < 0 || from >= board.slotCount) {
+      return;
+    }
+    if (_guardLockedBoard(board, '排序图片')) {
+      return;
+    }
+    final compactBoard = _compactBoardItems(board);
+    final items = [...compactBoard.items]
+      ..sort((a, b) => a.slotIndex.compareTo(b.slotIndex));
+    final draggedIndex = items.indexWhere((item) => item.slotIndex == from);
+    if (draggedIndex < 0) {
+      return;
+    }
+    final draggedItem = items.removeAt(draggedIndex);
+    final target = to.clamp(0, compactBoard.slotCount - 1).toInt();
+    final targetIndex = target.clamp(0, items.length).toInt();
+    items.insert(targetIndex, draggedItem);
+    for (var i = 0; i < items.length; i++) {
+      items[i] = items[i].copyWith(slotIndex: i);
+    }
+    _replaceBoard(compactBoard.copyWith(items: items), saveWorkspace: false);
+    _scheduleWorkspaceSnapshotSave();
+  }
+
+  void moveItems(Set<String> assetIds, int to) {
+    final board = value.selectedBoard;
+    if (board == null || assetIds.isEmpty) {
+      return;
+    }
+    if (_guardLockedBoard(board, '排序图片')) {
+      return;
+    }
+    final compactBoard = _compactBoardItems(board);
+    final items = [...compactBoard.items]
+      ..sort((a, b) => a.slotIndex.compareTo(b.slotIndex));
+    final movingItems = [
+      for (final item in items)
+        if (assetIds.contains(item.asset.id)) item,
+    ];
+    if (movingItems.isEmpty) {
+      return;
+    }
+    if (movingItems.length == 1) {
+      moveItem(movingItems.single.slotIndex, to);
+      return;
+    }
+    final remainingItems = [
+      for (final item in items)
+        if (!assetIds.contains(item.asset.id)) item,
+    ];
+    final target = to.clamp(0, compactBoard.slotCount - 1).toInt();
+    final targetIndex = target.clamp(0, remainingItems.length).toInt();
+    remainingItems.insertAll(targetIndex, movingItems);
+    for (var i = 0; i < remainingItems.length; i++) {
+      remainingItems[i] = remainingItems[i].copyWith(slotIndex: i);
+    }
+    _replaceBoard(
+      compactBoard.copyWith(items: remainingItems),
+      saveWorkspace: false,
+    );
+    _scheduleWorkspaceSnapshotSave();
+  }
+
+  void updateCaption(int index, String caption) {
+    final board = value.selectedBoard;
+    if (board == null || index < 0 || index >= board.slotCount) {
+      return;
+    }
+    if (_guardLockedBoard(board, '编辑描述')) {
+      return;
+    }
+    final items = [...board.items];
+    final itemIndex = items.indexWhere((item) => item.slotIndex == index);
+    if (itemIndex < 0) {
+      return;
+    }
+    items[itemIndex] = items[itemIndex].copyWith(caption: caption);
+    _replaceBoard(board.copyWith(items: items));
+  }
+
+  void toggleItemFlipHorizontal(int index) {
+    final board = value.selectedBoard;
+    if (board == null || index < 0 || index >= board.slotCount) {
+      return;
+    }
+    if (_guardLockedBoard(board, '翻转图片')) {
+      return;
+    }
+    final items = [...board.items];
+    final itemIndex = items.indexWhere((item) => item.slotIndex == index);
+    if (itemIndex < 0) {
+      return;
+    }
+    final item = items[itemIndex];
+    final flipped = !item.flipHorizontal;
+    items[itemIndex] = item.copyWith(flipHorizontal: flipped);
+    _replaceBoard(
+      board.copyWith(items: items),
+      message: flipped ? '已水平翻转图片' : '已恢复图片水平方向',
+    );
+  }
+
+  void toggleItemFlipVertical(int index) {
+    final board = value.selectedBoard;
+    if (board == null || index < 0 || index >= board.slotCount) {
+      return;
+    }
+    if (_guardLockedBoard(board, '翻转图片')) {
+      return;
+    }
+    final items = [...board.items];
+    final itemIndex = items.indexWhere((item) => item.slotIndex == index);
+    if (itemIndex < 0) {
+      return;
+    }
+    final item = items[itemIndex];
+    final flipped = !item.flipVertical;
+    items[itemIndex] = item.copyWith(flipVertical: flipped);
+    _replaceBoard(
+      board.copyWith(items: items),
+      message: flipped ? '已垂直翻转图片' : '已恢复图片垂直方向',
+    );
+  }
+
+  void updateRowCaption(int rowIndex, String caption) {
+    final board = value.selectedBoard;
+    if (board == null || rowIndex < 0 || rowIndex >= board.rows) {
+      return;
+    }
+    if (_guardLockedBoard(board, '编辑描述')) {
+      return;
+    }
+    final rowCaptions = _rowCaptionsForRows(board, board.rows);
+    rowCaptions[rowIndex] = caption;
+    _replaceBoard(board.copyWith(rowCaptions: rowCaptions));
+  }
+
+  void applyCaptionsByLines(String text) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '应用描述文本')) {
+      return;
+    }
+    final lines = text
+        .split(RegExp(r'\r?\n'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+    if (board.rowDescriptionEnabled) {
+      final rowCaptions = _rowCaptionsForRows(board, board.rows);
+      for (var rowIndex = 0; rowIndex < board.rows; rowIndex++) {
+        if (rowIndex >= lines.length) {
+          break;
+        }
+        rowCaptions[rowIndex] = lines[rowIndex];
+      }
+      _replaceBoard(
+        board.copyWith(rowCaptions: rowCaptions),
+        message: '已按行应用描述文本',
+      );
+      return;
+    }
+    final items = [...board.items];
+    var lineIndex = 0;
+    for (var slotIndex = 0; slotIndex < board.slotCount; slotIndex++) {
+      if (lineIndex >= lines.length) {
+        break;
+      }
+      final itemIndex = items.indexWhere((item) => item.slotIndex == slotIndex);
+      if (itemIndex < 0) {
+        continue;
+      }
+      items[itemIndex] = items[itemIndex].copyWith(caption: lines[lineIndex]);
+      lineIndex++;
+    }
+    _replaceBoard(board.copyWith(items: items), message: '已按行应用描述文本');
+  }
+
+  Future<VisionImageEditSuggestion> suggestImageEditPromptForItem(
+    StoryboardItem item,
+  ) async {
+    final settingsController = _settingsController;
+    if (settingsController == null) {
+      throw StateError('视觉模型设置尚未初始化');
+    }
+    if (value.isAnalyzing) {
+      throw StateError('正在解析故事板，请稍后再生成自动提示词');
+    }
+    final board = value.selectedBoard;
+    if (board == null) {
+      throw StateError('请先创建故事板');
+    }
+    if (board.locked) {
+      final message = '${board.name} 已锁定，请先解锁后再生成自动提示词';
+      value = value.copyWith(message: message);
+      throw StateError(message);
+    }
+    final orderedItems = _orderedVisibleItems(board);
+    final itemIndex = orderedItems.indexWhere(
+      (candidate) =>
+          candidate.asset.id == item.asset.id &&
+          candidate.slotIndex == item.slotIndex,
+    );
+    if (itemIndex < 0) {
+      throw StateError('当前图片已不在画板中');
+    }
+    final currentItem = orderedItems[itemIndex];
+    final imageFile = File(currentItem.asset.path);
+    if (!imageFile.existsSync()) {
+      throw const FileSystemException('当前图片文件不存在');
+    }
+
+    final operationToken = _beginVisionOperation();
+    final batch = await _visionPromptBatchForCurrentBoard(
+      board: board,
+      orderedItems: orderedItems,
+      operationToken: operationToken,
+    );
+    if (_isVisionOperationCancelled(operationToken)) {
+      throw StateError('已取消自动提示词生成');
+    }
+    if (batch == null) {
+      throw StateError('自动提示词前解析失败，请检查视觉模型配置后重试');
+    }
+
+    final currentBoard = value.selectedBoard;
+    if (currentBoard == null || currentBoard.id != board.id) {
+      throw StateError('当前画板已切换，请重新生成自动提示词');
+    }
+    final currentOrderedItems = _orderedVisibleItems(currentBoard);
+    final currentItemIndex = currentOrderedItems.indexWhere(
+      (candidate) => candidate.asset.id == item.asset.id,
+    );
+    if (currentItemIndex < 0) {
+      throw StateError('当前图片已不在画板中');
+    }
+    final refreshedItem = currentOrderedItems[currentItemIndex];
+    final rowIndex = refreshedItem.slotIndex ~/ currentBoard.columns;
+    final columnIndex = refreshedItem.slotIndex % currentBoard.columns;
+    final recordItems = _visionRecordItemsInCurrentOrder(
+      currentOrderedItems,
+      batch.items,
+    );
+    if (recordItems.length != currentOrderedItems.length) {
+      throw StateError('解析结果未完整覆盖当前画板图片');
+    }
+    final analyses = recordItems.map((item) => item.analysis).toList();
+    final summary = _summaryForPrompt(currentBoard, analyses);
+    final storyboardSummary = _storyboardSummaryText(summary);
+
+    value = value.copyWith(message: '正在综合故事板解析生成自动提示词...');
+    try {
+      final suggestion = await _visionService.suggestImageEditPrompt(
+        settings: settingsController.value,
+        imageFile: imageFile,
+        sequenceNo: currentItemIndex + 1,
+        rowIndex: rowIndex,
+        columnIndex: columnIndex,
+        currentCaption: refreshedItem.caption,
+        previousCaption: currentItemIndex > 0
+            ? currentOrderedItems[currentItemIndex - 1].caption
+            : '',
+        nextCaption: currentItemIndex + 1 < currentOrderedItems.length
+            ? currentOrderedItems[currentItemIndex + 1].caption
+            : '',
+        rowCaption: currentBoard.rowCaptionAt(rowIndex),
+        storyboardSummary: storyboardSummary,
+        currentAnalysis: analyses[currentItemIndex],
+        previousAnalysis: currentItemIndex > 0
+            ? analyses[currentItemIndex - 1]
+            : null,
+        nextAnalysis: currentItemIndex + 1 < analyses.length
+            ? analyses[currentItemIndex + 1]
+            : null,
+        storyboardAnalyses: analyses,
+      );
+      value = value.copyWith(message: '已生成当前分镜修改建议');
+      return suggestion;
+    } catch (error) {
+      value = value.copyWith(message: '自动提示词失败：$error');
+      rethrow;
+    }
+  }
+
+  Future<bool> generateReplacementForItem({
+    required StoryboardItem item,
+    required String prompt,
+    required String model,
+    required String aspectRatio,
+    required String imageSize,
+    required String quality,
+    required List<String> extraReferenceImagePaths,
+  }) async {
+    if (value.isGeneratingImage) {
+      value = value.copyWith(message: '正在修改图片，请稍候');
+      return false;
+    }
+    final directories = _directories;
+    if (directories == null) {
+      value = value.copyWith(message: '数据目录尚未初始化，无法生成图片');
+      return false;
+    }
+    final settingsController = _settingsController;
+    if (settingsController == null) {
+      value = value.copyWith(message: '图片生成设置尚未初始化');
+      return false;
+    }
+    final board = value.selectedBoard;
+    if (board == null) {
+      value = value.copyWith(message: '请先创建故事板');
+      return false;
+    }
+    if (_guardLockedBoard(board, '修改图片')) {
+      return false;
+    }
+    final currentItem = board.itemAtSlot(item.slotIndex);
+    if (currentItem == null || currentItem.asset.id != item.asset.id) {
+      value = value.copyWith(message: '当前图片已变化，请重新选择后再修改');
+      return false;
+    }
+    final source = File(currentItem.asset.path);
+    if (!source.existsSync()) {
+      value = value.copyWith(message: '当前图片文件不存在，无法作为参考图');
+      return false;
+    }
+    if (prompt.trim().isEmpty) {
+      value = value.copyWith(message: '请先输入修改提示词');
+      return false;
+    }
+
+    final references = [
+      source.path,
+      for (final path in extraReferenceImagePaths)
+        if (path.trim().isNotEmpty) path.trim(),
+    ];
+    final generationId = _uuid.v4();
+    _database.insertImageGenerationRecord(
+      id: generationId,
+      boardId: board.id,
+      slotIndex: currentItem.slotIndex,
+      sourceAssetId: currentItem.asset.id,
+      sourcePath: _toStoredPath(currentItem.asset.path),
+      model: model,
+      prompt: prompt,
+      aspectRatio: aspectRatio,
+      imageSize: imageSize,
+      quality: quality,
+      referencePathsJson: jsonEncode([
+        for (final path in references) _toStoredPath(path),
+      ]),
+      status: 'running',
+    );
+
+    value = value.copyWith(isGeneratingImage: true, message: '正在修改当前图片...');
+
+    try {
+      final settings = settingsController.value;
+      final provider = ImageGenerationProviderResolver.resolve(
+        settings: settings,
+        model: model,
+      );
+      final result = await _imageGenerationService.generateEditedImage(
+        ImageGenerationRequest(
+          provider: provider,
+          model: model,
+          prompt: prompt,
+          aspectRatio: aspectRatio,
+          imageSize: imageSize,
+          quality: quality,
+          referenceImagePaths: references,
+          outputDirectory: Directory(
+            p.join(directories.generatedImages.path, board.id),
+          ),
+        ),
+      );
+      final replacement = await _registerGeneratedImageAsset(
+        sourceAsset: currentItem.asset,
+        resultPath: result.localPath,
+      );
+      final applied = _replaceCurrentItemAsset(
+        boardId: board.id,
+        slotIndex: currentItem.slotIndex,
+        oldAssetId: currentItem.asset.id,
+        replacement: replacement,
+      );
+      _database.updateImageGenerationRecord(
+        id: generationId,
+        status: applied ? 'succeeded' : 'orphaned',
+        resultAssetId: replacement.id,
+        resultPath: _toStoredPath(replacement.path),
+        rawResponse: result.rawResponse,
+      );
+      return applied;
+    } catch (error) {
+      _database.updateImageGenerationRecord(
+        id: generationId,
+        status: 'failed',
+        errorMessage: error.toString(),
+      );
+      value = value.copyWith(
+        isGeneratingImage: false,
+        message: '图片修改失败：$error',
+      );
+      return false;
+    }
+  }
+
+  Future<void> analyzeSelectedBoardWithVision() async {
+    final board = value.selectedBoard;
+    if (board == null) {
+      value = value.copyWith(message: '请先创建故事板');
+      return;
+    }
+    if (_guardLockedBoard(board, '自动解析')) {
+      return;
+    }
+    if (_orderedVisibleItems(board).isEmpty) {
+      value = value.copyWith(message: '当前画板没有可解析的图片');
+      return;
+    }
+    await _enqueueVisionTask(
+      StoryboardVisionTask(
+        boardId: board.id,
+        kind: StoryboardVisionTaskKind.analyze,
+      ),
+    );
+  }
+
+  Future<void> _analyzeBoardWithVision({
+    required String boardId,
+    required int operationToken,
+    bool triggeredByReorder = false,
+    bool triggeredByPrompt = false,
+  }) async {
+    final settingsController = _settingsController;
+    if (settingsController == null) {
+      value = value.copyWith(message: '视觉模型设置尚未初始化');
+      return;
+    }
+    final board = _boardById(boardId);
+    if (board == null) {
+      value = value.copyWith(message: '目标画板已不存在');
+      return;
+    }
+    if (_guardLockedBoard(board, '自动解析')) {
+      return;
+    }
+    final orderedItems =
+        board.items
+            .where(
+              (item) => item.slotIndex >= 0 && item.slotIndex < board.slotCount,
+            )
+            .toList()
+          ..sort((a, b) => a.slotIndex.compareTo(b.slotIndex));
+    if (orderedItems.isEmpty) {
+      value = value.copyWith(message: '当前画板没有可解析的图片');
+      return;
+    }
+
+    final settings = settingsController.value;
+    final runId = _uuid.v4();
+    await _logVisionEvent('analysis_start', {
+      'runId': runId,
+      'boardId': board.id,
+      'triggeredByReorder': triggeredByReorder,
+      'triggeredByPrompt': triggeredByPrompt,
+      'model': settings.visionModel,
+      'totalImages': orderedItems.length,
+    });
+    _database.insertVisionAnalysisRun(
+      id: runId,
+      boardId: board.id,
+      model: settings.visionModel,
+      status: 'running',
+      totalImages: orderedItems.length,
+    );
+
+    value = value.copyWith(
+      isAnalyzing: true,
+      isCancellingAnalysis: false,
+      message: '正在解析故事板图片 0/${orderedItems.length}',
+    );
+
+    final analyzedItems = <_AnalyzedStoryboardItem>[];
+    var successCount = 0;
+    var failedCount = 0;
+
+    Future<void> finishCancelled() async {
+      _database.updateVisionAnalysisRun(
+        id: runId,
+        status: 'cancelled',
+        successCount: successCount,
+        errorMessage: '用户取消',
+      );
+      await _finishCancelledVisionOperation(
+        operationToken,
+        runId: runId,
+        message: triggeredByReorder
+            ? '已取消自动重排序'
+            : triggeredByPrompt
+            ? '已取消自动提示词解析'
+            : '已取消自动解析',
+      );
+    }
+
+    for (var i = 0; i < orderedItems.length; i++) {
+      if (_isVisionOperationCancelled(operationToken)) {
+        await finishCancelled();
+        return;
+      }
+      final item = orderedItems[i];
+      final rowIndex = item.slotIndex ~/ board.columns;
+      final columnIndex = item.slotIndex % board.columns;
+      value = value.copyWith(
+        message: '正在解析第 ${i + 1}/${orderedItems.length} 张图片',
+      );
+      await _logVisionEvent('analysis_image_start', {
+        'runId': runId,
+        'sequenceNo': i + 1,
+        'slotIndex': item.slotIndex,
+        'assetId': item.asset.id,
+        'path': item.asset.path,
+      });
+      try {
+        final analysis = await _visionService.analyzeImage(
+          settings: settings,
+          imageFile: File(item.asset.path),
+          sequenceNo: i + 1,
+          rowIndex: rowIndex,
+          columnIndex: columnIndex,
+          onRecovery: (mode) {
+            if (_isVisionOperationCancelled(operationToken)) {
+              return;
+            }
+            final recoveryMessage = switch (mode) {
+              VisionImageRecoveryMode.jsonRepair => '第 ${i + 1} 张返回格式异常，正在自动修复',
+              VisionImageRecoveryMode.imageRetry => '第 ${i + 1} 张解析异常，正在重新解析',
+              VisionImageRecoveryMode.simplifiedFallback =>
+                '第 ${i + 1} 张完整解析异常，正在使用稳定模式',
+              VisionImageRecoveryMode.none =>
+                '正在解析第 ${i + 1}/${orderedItems.length} 张图片',
+            };
+            value = value.copyWith(message: recoveryMessage);
+          },
+        );
+        if (_isVisionOperationCancelled(operationToken)) {
+          await finishCancelled();
+          return;
+        }
+        _database.insertVisionAnalysisItem(
+          id: _uuid.v4(),
+          runId: runId,
+          boardId: board.id,
+          cutResultId: item.asset.id,
+          slotIndex: item.slotIndex,
+          sequenceNo: i + 1,
+          rowIndex: rowIndex,
+          columnIndex: columnIndex,
+          status: 'success',
+          caption: analysis.caption,
+          detail: analysis.detail,
+          scene: analysis.scene,
+          props: analysis.props,
+          people: analysis.people,
+          expression: analysis.expression,
+          bodyAction: analysis.bodyAction,
+          movementTrend: analysis.movementTrend,
+          cameraMovement: analysis.cameraMovement,
+          shotSize: analysis.shotSize,
+          composition: analysis.composition,
+          subjectDirection: analysis.subjectDirection,
+          gazeDirection: analysis.gazeDirection,
+          actionStage: analysis.actionStage,
+          spatialRelation: analysis.spatialRelation,
+          chronologyCue: analysis.chronologyCue,
+          cameraAngle: analysis.cameraAngle,
+          visualFocus: analysis.visualFocus,
+          lightingMood: analysis.lightingMood,
+          colorPalette: analysis.colorPalette,
+          narrativeFunction: analysis.narrativeFunction,
+          transitionHint: analysis.transitionHint,
+          rawResponse: analysis.rawResponse,
+        );
+        analyzedItems.add(
+          _AnalyzedStoryboardItem(
+            slotIndex: item.slotIndex,
+            rowIndex: rowIndex,
+            columnIndex: columnIndex,
+            analysis: analysis,
+          ),
+        );
+        successCount++;
+        if (analysis.recoveryMode != VisionImageRecoveryMode.none) {
+          await _logVisionEvent('analysis_image_recovery', {
+            'runId': runId,
+            'sequenceNo': i + 1,
+            'assetId': item.asset.id,
+            'mode': analysis.recoveryMode.name,
+            'requestCount': analysis.requestCount,
+            'recoveryErrors': analysis.recoveryErrors,
+          });
+        }
+        await _logVisionEvent('analysis_image_success', {
+          'runId': runId,
+          'sequenceNo': i + 1,
+          'assetId': item.asset.id,
+          'recoveryMode': analysis.recoveryMode.name,
+          'requestCount': analysis.requestCount,
+          'recoveryErrors': analysis.recoveryErrors,
+          'rawResponsePreview': _visionLogPreview(analysis.rawResponse),
+        });
+      } catch (error) {
+        if (_isVisionOperationCancelled(operationToken)) {
+          await finishCancelled();
+          return;
+        }
+        failedCount++;
+        final analysisError = error is VisionImageAnalysisException
+            ? error
+            : null;
+        await _logVisionEvent('analysis_image_failed', {
+          'runId': runId,
+          'sequenceNo': i + 1,
+          'assetId': item.asset.id,
+          'error': error.toString(),
+          if (analysisError != null) ...{
+            'requestCount': analysisError.requestCount,
+            'recoveryErrors': analysisError.recoveryErrors,
+            'rawResponsePreview': _visionLogPreview(analysisError.rawResponse),
+          },
+        });
+        _database.insertVisionAnalysisItem(
+          id: _uuid.v4(),
+          runId: runId,
+          boardId: board.id,
+          cutResultId: item.asset.id,
+          slotIndex: item.slotIndex,
+          sequenceNo: i + 1,
+          rowIndex: rowIndex,
+          columnIndex: columnIndex,
+          status: 'failed',
+          caption: '',
+          detail: '',
+          scene: '',
+          props: '',
+          people: '',
+          expression: '',
+          bodyAction: '',
+          movementTrend: '',
+          rawResponse: analysisError?.rawResponse ?? '',
+          errorMessage: error.toString(),
+        );
+      }
+    }
+
+    var captionRewriteError = '';
+    var captionRewriteFallbackCount = 0;
+    var displayAnalyzedItems = analyzedItems;
+    if (analyzedItems.length > 1) {
+      if (_isVisionOperationCancelled(operationToken)) {
+        await finishCancelled();
+        return;
+      }
+      value = value.copyWith(message: '正在连贯化故事板文本...');
+      await _logVisionEvent('caption_rewrite_start', {
+        'runId': runId,
+        'count': analyzedItems.length,
+      });
+      try {
+        final captionResult = await _visionService.rewriteStoryboardCaptions(
+          settings: settings,
+          analyses: analyzedItems.map((item) => item.analysis).toList(),
+          onProgress: (completed, total) {
+            if (!_isVisionOperationCancelled(operationToken)) {
+              value = value.copyWith(message: '正在连贯化故事板文本 $completed/$total');
+            }
+          },
+        );
+        if (_isVisionOperationCancelled(operationToken)) {
+          await finishCancelled();
+          return;
+        }
+        displayAnalyzedItems = [
+          for (var i = 0; i < analyzedItems.length; i++)
+            analyzedItems[i].copyWith(
+              analysis: analyzedItems[i].analysis.withCaption(
+                captionResult.captions[i],
+              ),
+            ),
+        ];
+        captionRewriteFallbackCount = captionResult.fallbackSequenceNos.length;
+        await _logVisionEvent('caption_rewrite_success', {
+          'runId': runId,
+          'requestedCount': analyzedItems.length,
+          'initialReturnedCount': captionResult.initialReturnedCount,
+          'repairedSequenceNos': captionResult.repairedSequenceNos,
+          'fallbackSequenceNos': captionResult.fallbackSequenceNos,
+          'diagnostics': captionResult.diagnostics,
+          'rawResponsePreview': _visionLogPreview(captionResult.rawResponse),
+        });
+      } catch (error) {
+        if (_isVisionOperationCancelled(operationToken)) {
+          await finishCancelled();
+          return;
+        }
+        captionRewriteFallbackCount = analyzedItems.length;
+        await _logVisionEvent('caption_rewrite_failed', {
+          'runId': runId,
+          'error': error.toString(),
+          'recovery': 'controller_preserved_analyzed_captions',
+        });
+      }
+    }
+
+    StoryboardSummary? summary;
+    var summaryError = '';
+    if (displayAnalyzedItems.isNotEmpty) {
+      if (_isVisionOperationCancelled(operationToken)) {
+        await finishCancelled();
+        return;
+      }
+      value = value.copyWith(message: '正在归纳故事板内容...');
+      await _logVisionEvent('summary_start', {
+        'runId': runId,
+        'count': displayAnalyzedItems.length,
+      });
+      try {
+        final summaryResult = await _visionService.summarizeStoryboard(
+          settings: settings,
+          analyses: displayAnalyzedItems.map((item) => item.analysis).toList(),
+        );
+        if (_isVisionOperationCancelled(operationToken)) {
+          await finishCancelled();
+          return;
+        }
+        summary = StoryboardSummary(
+          outline: summaryResult.outline,
+          content: summaryResult.content,
+          scenes: summaryResult.scenes,
+          props: summaryResult.props,
+        );
+        _database.upsertStoryboardSummary(
+          boardId: board.id,
+          runId: runId,
+          outline: summaryResult.outline,
+          content: summaryResult.content,
+          scenes: summaryResult.scenes,
+          props: summaryResult.props,
+          rawResponse: summaryResult.rawResponse,
+        );
+        await _logVisionEvent('summary_success', {'runId': runId});
+      } catch (error) {
+        if (_isVisionOperationCancelled(operationToken)) {
+          await finishCancelled();
+          return;
+        }
+        summaryError = error.toString();
+        await _logVisionEvent('summary_failed', {
+          'runId': runId,
+          'error': summaryError,
+        });
+      }
+    }
+
+    final errorMessage = [
+      if (captionRewriteError.isNotEmpty) captionRewriteError,
+      if (summaryError.isNotEmpty) summaryError,
+    ].join('\n');
+    final status =
+        failedCount == 0 && captionRewriteError.isEmpty && summaryError.isEmpty
+        ? 'completed'
+        : 'completed_with_errors';
+    _database.updateVisionAnalysisRun(
+      id: runId,
+      status: status,
+      successCount: successCount,
+      errorMessage: errorMessage,
+    );
+    await _logVisionEvent('analysis_complete', {
+      'runId': runId,
+      'status': status,
+      'successCount': successCount,
+      'failedCount': failedCount,
+      if (errorMessage.isNotEmpty) 'error': errorMessage,
+    });
+    _applyVisionResults(
+      boardId: board.id,
+      analyzedItems: displayAnalyzedItems,
+      summary: summary,
+      message: _visionCompletionMessage(
+        totalCount: analyzedItems.length,
+        successCount: successCount,
+        failedCount: failedCount,
+        captionRewriteError: captionRewriteError,
+        captionRewriteFallbackCount: captionRewriteFallbackCount,
+        summaryError: summaryError,
+      ),
+    );
+  }
+
+  Future<void> reorderSelectedBoardByVisionAnalysis() async {
+    final settingsController = _settingsController;
+    if (settingsController == null) {
+      value = value.copyWith(message: '视觉模型设置尚未初始化');
+      return;
+    }
+    var board = value.selectedBoard;
+    if (board == null) {
+      value = value.copyWith(message: '请先创建故事板');
+      return;
+    }
+    if (_guardLockedBoard(board, '自动重排序')) {
+      return;
+    }
+    var orderedItems = _orderedVisibleItems(board);
+    if (orderedItems.length < 2) {
+      value = value.copyWith(message: '至少需要 2 张图片才能自动重排序');
+      return;
+    }
+
+    await _enqueueVisionTask(
+      StoryboardVisionTask(
+        boardId: board.id,
+        kind: StoryboardVisionTaskKind.reorder,
+      ),
+    );
+  }
+
+  Future<void> _reorderBoardByVisionAnalysis({
+    required String boardId,
+    required int operationToken,
+  }) async {
+    final settingsController = _settingsController;
+    if (settingsController == null) {
+      value = value.copyWith(message: '视觉模型设置尚未初始化');
+      return;
+    }
+    var board = _boardById(boardId);
+    if (board == null) {
+      value = value.copyWith(message: '目标画板已不存在');
+      return;
+    }
+    if (_guardLockedBoard(board, '自动重排序')) {
+      return;
+    }
+    var orderedItems = _orderedVisibleItems(board);
+    if (orderedItems.length < 2) {
+      value = value.copyWith(message: '至少需要 2 张图片才能自动重排序');
+      return;
+    }
+
+    final reorderRunId = _uuid.v4();
+    await _logVisionEvent('reorder_start', {
+      'runId': reorderRunId,
+      'boardId': board.id,
+      'imageCount': orderedItems.length,
+      'model': settingsController.value.visionModel,
+    });
+    final batch = await _visionOrderingBatchForBoard(
+      board: board,
+      orderedItems: orderedItems,
+      operationToken: operationToken,
+    );
+    if (_isVisionOperationCancelled(operationToken)) {
+      await _finishCancelledVisionOperation(
+        operationToken,
+        runId: reorderRunId,
+        message: '已取消自动重排序',
+      );
+      return;
+    }
+    if (batch == null) {
+      return;
+    }
+    board = _boardById(batch.run.boardId);
+    if (board == null || board.id != batch.run.boardId) {
+      value = value.copyWith(message: '目标画板已不存在，请重新自动重排序');
+      return;
+    }
+    orderedItems = _orderedVisibleItems(board);
+
+    value = value.copyWith(
+      isAnalyzing: true,
+      isCancellingAnalysis: false,
+      message: '正在根据解析内容自动重排序...',
+    );
+
+    final settings = settingsController.value;
+    final currentItemByAssetId = {
+      for (final item in orderedItems) item.asset.id: item,
+    };
+    final recordItems = _visionRecordItemsInCurrentOrder(
+      orderedItems,
+      batch.items,
+    );
+    if (recordItems.length != orderedItems.length) {
+      value = value.copyWith(
+        isAnalyzing: false,
+        isCancellingAnalysis: false,
+        message: '当前画板图片与最近解析结果不一致，请重新自动解析后再重排序',
+      );
+      return;
+    }
+
+    try {
+      await _logVisionEvent('reorder_order_request_start', {
+        'runId': reorderRunId,
+        'analysisCount': recordItems.length,
+      });
+      final orderResult = await _visionService.suggestStoryboardOrder(
+        settings: settings,
+        analyses: recordItems.map((item) => item.analysis).toList(),
+      );
+      if (_isVisionOperationCancelled(operationToken)) {
+        await _finishCancelledVisionOperation(
+          operationToken,
+          runId: reorderRunId,
+          message: '已取消自动重排序',
+        );
+        return;
+      }
+      await _logVisionEvent('reorder_order_request_success', {
+        'runId': reorderRunId,
+        'order': orderResult.order,
+        'rawResponse': orderResult.rawResponse,
+      });
+      final reorderedRecordItems = [
+        for (final index in orderResult.order) recordItems[index - 1],
+      ];
+
+      var captionRewriteError = '';
+      var captionRewriteFallbackCount = 0;
+      var displayRecordItems = reorderedRecordItems;
+      try {
+        await _logVisionEvent('reorder_caption_rewrite_start', {
+          'runId': reorderRunId,
+          'count': reorderedRecordItems.length,
+        });
+        final captionResult = await _visionService.rewriteStoryboardCaptions(
+          settings: settings,
+          analyses: reorderedRecordItems.map((item) => item.analysis).toList(),
+          onProgress: (completed, total) {
+            if (!_isVisionOperationCancelled(operationToken)) {
+              value = value.copyWith(message: '正在连贯化重排序文本 $completed/$total');
+            }
+          },
+        );
+        if (_isVisionOperationCancelled(operationToken)) {
+          await _finishCancelledVisionOperation(
+            operationToken,
+            runId: reorderRunId,
+            message: '已取消自动重排序',
+          );
+          return;
+        }
+        displayRecordItems = [
+          for (var i = 0; i < reorderedRecordItems.length; i++)
+            reorderedRecordItems[i].copyWith(
+              analysis: reorderedRecordItems[i].analysis.withCaption(
+                captionResult.captions[i],
+              ),
+            ),
+        ];
+        captionRewriteFallbackCount = captionResult.fallbackSequenceNos.length;
+        await _logVisionEvent('reorder_caption_rewrite_success', {
+          'runId': reorderRunId,
+          'requestedCount': reorderedRecordItems.length,
+          'initialReturnedCount': captionResult.initialReturnedCount,
+          'repairedSequenceNos': captionResult.repairedSequenceNos,
+          'fallbackSequenceNos': captionResult.fallbackSequenceNos,
+          'diagnostics': captionResult.diagnostics,
+          'rawResponsePreview': _visionLogPreview(captionResult.rawResponse),
+        });
+      } catch (error) {
+        if (_isVisionOperationCancelled(operationToken)) {
+          await _finishCancelledVisionOperation(
+            operationToken,
+            runId: reorderRunId,
+            message: '已取消自动重排序',
+          );
+          return;
+        }
+        captionRewriteFallbackCount = reorderedRecordItems.length;
+        await _logVisionEvent('reorder_caption_rewrite_failed', {
+          'runId': reorderRunId,
+          'error': error.toString(),
+          'recovery': 'controller_preserved_analyzed_captions',
+        });
+      }
+
+      final nextAnalyzedItems = [
+        for (var i = 0; i < displayRecordItems.length; i++)
+          _AnalyzedStoryboardItem(
+            slotIndex: i,
+            rowIndex: i ~/ board.columns,
+            columnIndex: i % board.columns,
+            analysis: displayRecordItems[i].analysis,
+          ),
+      ];
+
+      var summaryError = '';
+      var summary = _fallbackSummaryForAnalyses(
+        nextAnalyzedItems.map((item) => item.analysis).toList(),
+      );
+      try {
+        await _logVisionEvent('reorder_summary_start', {
+          'runId': reorderRunId,
+          'count': nextAnalyzedItems.length,
+        });
+        final summaryResult = await _visionService.summarizeStoryboard(
+          settings: settings,
+          analyses: nextAnalyzedItems.map((item) => item.analysis).toList(),
+        );
+        if (_isVisionOperationCancelled(operationToken)) {
+          await _finishCancelledVisionOperation(
+            operationToken,
+            runId: reorderRunId,
+            message: '已取消自动重排序',
+          );
+          return;
+        }
+        summary = StoryboardSummary(
+          outline: summaryResult.outline,
+          content: summaryResult.content,
+          scenes: summaryResult.scenes,
+          props: summaryResult.props,
+        );
+        await _logVisionEvent('reorder_summary_success', {
+          'runId': reorderRunId,
+        });
+      } catch (error) {
+        if (_isVisionOperationCancelled(operationToken)) {
+          await _finishCancelledVisionOperation(
+            operationToken,
+            runId: reorderRunId,
+            message: '已取消自动重排序',
+          );
+          return;
+        }
+        summaryError = error.toString();
+        await _logVisionEvent('reorder_summary_failed', {
+          'runId': reorderRunId,
+          'error': summaryError,
+        });
+      }
+
+      final nextItems = <StoryboardItem>[];
+      for (var i = 0; i < displayRecordItems.length; i++) {
+        final recordItem = displayRecordItems[i];
+        final currentItem = currentItemByAssetId[recordItem.record.cutResultId];
+        if (currentItem == null) {
+          value = value.copyWith(
+            isAnalyzing: false,
+            isCancellingAnalysis: false,
+            message: '当前画板图片与最近解析结果不一致，请重新自动解析后再重排序',
+          );
+          return;
+        }
+        final analyzedCaption = recordItem.analysis.caption.trim();
+        nextItems.add(
+          currentItem.copyWith(
+            slotIndex: i,
+            caption: analyzedCaption.isNotEmpty
+                ? recordItem.analysis.caption
+                : currentItem.caption,
+          ),
+        );
+      }
+
+      final rowCaptions = _rowCaptionsForRows(board, board.rows);
+      if (board.rowDescriptionEnabled) {
+        for (var rowIndex = 0; rowIndex < board.rows; rowIndex++) {
+          final rowItems =
+              nextAnalyzedItems
+                  .where((item) => item.rowIndex == rowIndex)
+                  .toList()
+                ..sort((a, b) => a.columnIndex.compareTo(b.columnIndex));
+          rowCaptions[rowIndex] = composeVisionAnalysesDescription(
+            rowItems.map((item) => item.analysis).toList(),
+          );
+        }
+      }
+
+      final moved = !_sameItemOrder(orderedItems, nextItems);
+      _visionCancelRequested = false;
+      await _logVisionEvent('reorder_complete', {
+        'runId': reorderRunId,
+        'moved': moved,
+        if (captionRewriteError.isNotEmpty)
+          'captionRewriteError': captionRewriteError,
+        if (captionRewriteFallbackCount > 0)
+          'captionRewriteFallbackCount': captionRewriteFallbackCount,
+        if (summaryError.isNotEmpty) 'summaryError': summaryError,
+      });
+      final latestBoard = _boardById(board.id);
+      if (latestBoard == null) {
+        value = value.copyWith(
+          isAnalyzing: false,
+          isCancellingAnalysis: false,
+          message: '自动重排序完成，但目标画板已不存在',
+        );
+        return;
+      }
+      if (latestBoard.locked) {
+        value = value.copyWith(
+          isAnalyzing: false,
+          isCancellingAnalysis: false,
+          message: '${latestBoard.name} 已锁定，未写回自动重排序',
+        );
+        return;
+      }
+      _replaceBoard(
+        latestBoard.copyWith(
+          items: nextItems,
+          rowCaptions: rowCaptions,
+          summary: summary,
+        ),
+        message: _visionReorderCompletionMessage(
+          moved: moved,
+          captionRewriteError: captionRewriteError,
+          captionRewriteFallbackCount: captionRewriteFallbackCount,
+          summaryError: summaryError,
+        ),
+        isAnalyzing: false,
+        reorderAnimationToken: moved ? value.reorderAnimationToken + 1 : null,
+        selectBoard: value.selectedBoardId == latestBoard.id,
+      );
+    } catch (error) {
+      if (_isVisionOperationCancelled(operationToken)) {
+        await _finishCancelledVisionOperation(
+          operationToken,
+          runId: reorderRunId,
+          message: '已取消自动重排序',
+        );
+        return;
+      }
+      await _logVisionEvent('reorder_failed', {
+        'runId': reorderRunId,
+        'error': error.toString(),
+      });
+      value = value.copyWith(
+        isAnalyzing: false,
+        isCancellingAnalysis: false,
+        message: '自动重排序失败：$error',
+      );
+    }
+  }
+
+  void setResolution(int width, int _) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整画板尺寸')) {
+      return;
+    }
+    final nextWidth = width.clamp(320, 12000).toInt();
+    _replaceBoard(
+      board.copyWith(width: nextWidth).withAdaptiveHeight(),
+      message: '画板宽度已更新，高度已按宫格自动适配',
+    );
+  }
+
+  void setPortraitMode(bool enabled) {
+    final board = value.selectedBoard;
+    if (board == null || board.portraitMode == enabled) {
+      return;
+    }
+    if (_guardLockedBoard(board, '切换竖屏模式')) {
+      return;
+    }
+    final compactBoard = _compactBoardItems(board);
+    if (enabled) {
+      final nextRows = math.max(1, compactBoard.visibleItemCount);
+      _replaceBoard(
+        compactBoard
+            .copyWith(
+              rows: nextRows,
+              columns: 1,
+              configuredRows: board.effectiveConfiguredRows,
+              configuredColumns: board.effectiveConfiguredColumns,
+              rowCaptions: _rowCaptionsForRows(compactBoard, nextRows),
+              portraitMode: true,
+            )
+            .withAdaptiveHeight(),
+        message: '已切换为竖屏故事板（每行 1 张图）',
+      );
+      return;
+    }
+    final landscapeBoard = compactBoard.copyWith(portraitMode: false);
+    _replaceBoard(
+      _boardWithGridForItemCount(
+        landscapeBoard,
+        itemCount: landscapeBoard.visibleItemCount,
+      ).withAdaptiveHeight(),
+      message: '已恢复横屏宫格布局',
+    );
+  }
+
+  void setGrid(int rows, int columns) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整宫格布局')) {
+      return;
+    }
+    if (board.portraitMode) {
+      value = value.copyWith(message: '竖屏模式固定为每行 1 张图，请先关闭竖屏模式');
+      return;
+    }
+    final nextRows = rows.clamp(1, _maxGridExtent).toInt();
+    final nextColumns = columns.clamp(1, _maxGridExtent).toInt();
+    final nextBoard = _boardWithGridForItemCount(
+      board,
+      itemCount: board.visibleItemCount,
+      configuredRows: nextRows,
+      configuredColumns: nextColumns,
+    );
+    _replaceBoard(
+      nextBoard,
+      message: nextBoard.isAutoExpandedFromConfiguredLayout
+          ? '宫格布局已设置为 $nextRows x $nextColumns，当前图片已自动适配为 ${nextBoard.rows} x ${nextBoard.columns}'
+          : '宫格布局已更新为 $nextRows x $nextColumns',
+    );
+  }
+
+  void setColumns(int columns) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    setGrid(board.effectiveConfiguredRows, columns);
+  }
+
+  void setGap(double gap) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整图片间距')) {
+      return;
+    }
+    final nextGap = gap.clamp(0, 80).toDouble();
+    if ((board.gap - nextGap).abs() < 0.01) {
+      return;
+    }
+    final columns = math.max(1, board.columns);
+    final rows = math.max(1, board.rows);
+    final cellWidth = math.max(
+      1.0,
+      (board.width - board.gap * (columns + 1)) / columns,
+    );
+    final nextWidth = (cellWidth * columns + nextGap * (columns + 1))
+        .round()
+        .clamp(320, 12000)
+        .toInt();
+    final rowBandHeight = math.max(
+      1.0,
+      (board.height - board.gap * (rows + 1)) / rows,
+    );
+    final nextHeight = (rowBandHeight * rows + nextGap * (rows + 1))
+        .round()
+        .clamp(1, 60000)
+        .toInt();
+    final nextBoard = _compactBoardItems(
+      board.copyWith(width: nextWidth, height: nextHeight, gap: nextGap),
+    );
+    _setState(
+      value.copyWith(
+        boards: [
+          for (final item in value.boards)
+            if (item.id == nextBoard.id) nextBoard else item,
+        ],
+        message: '图片间距已更新，画板尺寸已自动扩展',
+      ),
+      saveWorkspace: false,
+    );
+    _scheduleWorkspaceSnapshotSave(delay: const Duration(milliseconds: 300));
+  }
+
+  void setStoryDescriptionEnabled(bool enabled) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整描述显示')) {
+      return;
+    }
+    _replaceBoard(
+      board.copyWith(storyDescriptionEnabled: enabled),
+      message: enabled ? '已显示故事描述文本框' : '已隐藏故事描述文本框',
+    );
+  }
+
+  void setRowDescriptionEnabled(bool enabled) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整描述显示')) {
+      return;
+    }
+    _replaceBoard(
+      board.copyWith(
+        rowDescriptionEnabled: enabled,
+        rowCaptions: _rowCaptionsForRows(board, board.rows),
+      ),
+      message: enabled ? '已启用逐行描述' : '已关闭逐行描述',
+    );
+  }
+
+  void setCaptionFontFamily(String fontFamily) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整描述字体')) {
+      return;
+    }
+    _replaceBoard(board.copyWith(captionFontFamily: fontFamily));
+  }
+
+  void setCaptionFontSize(double fontSize) {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return;
+    }
+    if (_guardLockedBoard(board, '调整描述字体')) {
+      return;
+    }
+    _replaceBoard(
+      board.copyWith(captionFontSize: fontSize.clamp(12, 48)),
+      saveWorkspace: false,
+    );
+    _scheduleWorkspaceSnapshotSave(delay: const Duration(milliseconds: 300));
+  }
+
+  void setRowDividerEnabled(bool enabled) {
+    final board = value.selectedBoard;
+    if (board == null || _guardLockedBoard(board, '调整行分割线')) {
+      return;
+    }
+    _replaceBoard(
+      board.copyWith(rowDividerEnabled: enabled),
+      message: enabled ? '已显示行分割线' : '已隐藏行分割线',
+    );
+  }
+
+  void setRowDividerStyle(StoryboardDividerStyle style) {
+    final board = value.selectedBoard;
+    if (board == null || _guardLockedBoard(board, '调整行分割线')) {
+      return;
+    }
+    _replaceBoard(board.copyWith(rowDividerStyle: style));
+  }
+
+  void setRowDividerOpacity(double opacity) {
+    final board = value.selectedBoard;
+    if (board == null || _guardLockedBoard(board, '调整行分割线')) {
+      return;
+    }
+    _replaceBoard(
+      board.copyWith(rowDividerOpacity: opacity.clamp(0.05, 1.0)),
+      saveWorkspace: false,
+    );
+    _scheduleWorkspaceSnapshotSave(delay: const Duration(milliseconds: 300));
+  }
+
+  void setTitleAlignment(StoryboardTitleAlignment alignment) {
+    final board = value.selectedBoard;
+    if (board == null || _guardLockedBoard(board, '调整标题对齐')) {
+      return;
+    }
+    _replaceBoard(board.copyWith(titleAlignment: alignment));
+  }
+
+  Directory? _folderDirectory(String folderId) {
+    for (final folder in value.folders) {
+      if (folder.id == folderId) {
+        return Directory(folder.path);
+      }
+    }
+    final root = _directories?.storyboardFolders;
+    if (root == null) {
+      return null;
+    }
+    final folder = Directory(p.join(root.path, folderId));
+    if (!folder.existsSync()) {
+      return null;
+    }
+    return folder;
+  }
+
+  Future<File?> _copyImageFileToFolder(File source, Directory folder) async {
+    if (!folder.existsSync()) {
+      await folder.create(recursive: true);
+    }
+    final originalTarget = File(p.join(folder.path, p.basename(source.path)));
+    if (originalTarget.existsSync() && _sameFilePath(source, originalTarget)) {
+      return null;
+    }
+    final target = _uniqueFile(folder, p.basename(source.path));
+    return source.copy(target.path);
+  }
+
+  Future<StoryboardCutAsset> _registerGeneratedImageAsset({
+    required StoryboardCutAsset sourceAsset,
+    required String resultPath,
+  }) async {
+    final file = File(resultPath);
+    final size = await _readImageSize(file);
+    final imageId = 'generated-image-${_uuid.v4()}';
+    final taskId = 'generated-task-${_uuid.v4()}';
+    final resultId = 'generated-cut-${_uuid.v4()}';
+    final originalName = 'AI修改_${p.basename(sourceAsset.path)}';
+    final now = DateTime.now().toIso8601String();
+    final storedPath = _toStoredPath(resultPath);
+
+    _database
+      ..upsertImportedImage(
+        id: imageId,
+        originalPath: sourceAsset.path,
+        originalName: originalName,
+        storedPath: storedPath,
+        width: size.width,
+        height: size.height,
+        createdAt: now,
+      )
+      ..upsertCutTask(
+        id: taskId,
+        imageId: imageId,
+        status: 'generated',
+        rows: 1,
+        columns: 1,
+        confidence: 1,
+      )
+      ..insertCutResult(
+        id: resultId,
+        taskId: taskId,
+        imageId: imageId,
+        indexNo: 1,
+        path: storedPath,
+        x: 0,
+        y: 0,
+        width: size.width,
+        height: size.height,
+        selected: true,
+      );
+
+    return StoryboardCutAsset(
+      id: resultId,
+      imageId: imageId,
+      sourceName: originalName,
+      path: resultPath,
+      indexNo: 1,
+    );
+  }
+
+  Future<({int width, int height})> _readImageSize(File file) async {
+    if (!file.existsSync()) {
+      return (width: 0, height: 0);
+    }
+    final bytes = await file.readAsBytes();
+    final transferable = TransferableTypedData.fromList([bytes]);
+    final size = await Isolate.run(() => _readImageSizeInWorker(transferable));
+    return (width: size[0], height: size[1]);
+  }
+
+  bool _replaceCurrentItemAsset({
+    required String boardId,
+    required int slotIndex,
+    required String oldAssetId,
+    required StoryboardCutAsset replacement,
+  }) {
+    StoryboardBoard? currentBoard;
+    for (final board in value.boards) {
+      if (board.id == boardId) {
+        currentBoard = board;
+        break;
+      }
+    }
+    if (currentBoard == null) {
+      value = value.copyWith(
+        isGeneratingImage: false,
+        message: '图片已生成，但当前画板已不存在',
+      );
+      return false;
+    }
+    if (currentBoard.locked) {
+      value = value.copyWith(
+        isGeneratingImage: false,
+        message: '${currentBoard.name} 已锁定，未自动替换',
+      );
+      return false;
+    }
+    final itemIndex = currentBoard.items.indexWhere(
+      (item) => item.slotIndex == slotIndex && item.asset.id == oldAssetId,
+    );
+    if (itemIndex < 0) {
+      value = value.copyWith(
+        isGeneratingImage: false,
+        message: '图片已生成，但当前格内容已变化，未自动替换',
+      );
+      return false;
+    }
+
+    final nextItems = [...currentBoard.items];
+    nextItems[itemIndex] = nextItems[itemIndex].copyWith(asset: replacement);
+    final nextBoard = _boardWithAdaptiveHeight(
+      currentBoard.copyWith(items: nextItems),
+    );
+    _setState(
+      value.copyWith(
+        assets: [
+          replacement,
+          for (final asset in value.assets)
+            if (asset.id != replacement.id) asset,
+        ],
+        boards: [
+          for (final board in value.boards)
+            if (board.id == boardId) nextBoard else board,
+        ],
+        selectedBoardId: boardId,
+        isGeneratingImage: false,
+        message: '图片修改完成，已替换当前格',
+      ),
+    );
+    return true;
+  }
+
+  File _uniqueFile(Directory folder, String fileName) {
+    final extension = p.extension(fileName);
+    final baseName = p.basenameWithoutExtension(fileName).trim().isEmpty
+        ? 'image'
+        : p.basenameWithoutExtension(fileName).trim();
+    var candidate = File(p.join(folder.path, '$baseName$extension'));
+    var index = 2;
+    while (candidate.existsSync()) {
+      candidate = File(p.join(folder.path, '${baseName}_$index$extension'));
+      index++;
+    }
+    return candidate;
+  }
+
+  String _uniqueFolderName(Directory root, String folderName) {
+    var candidate = folderName;
+    var index = 2;
+    while (Directory(p.join(root.path, candidate)).existsSync()) {
+      candidate = '${folderName}_$index';
+      index++;
+    }
+    return candidate;
+  }
+
+  String _safeFolderName(String name) {
+    var result = name.trim();
+    for (final char in const ['<', '>', ':', '"', '/', '\\', '|', '?', '*']) {
+      result = result.replaceAll(char, '_');
+    }
+    result = result.replaceAll(RegExp(r'\s+'), ' ');
+    result = result.replaceAll(RegExp(r'[. ]+$'), '');
+    return result.isEmpty ? '自定义文件夹' : result;
+  }
+
+  bool _sameFilePath(File a, File b) {
+    final first = p.normalize(a.absolute.path);
+    final second = p.normalize(b.absolute.path);
+    if (Platform.isWindows) {
+      return first.toLowerCase() == second.toLowerCase();
+    }
+    return first == second;
+  }
+
+  bool _isSupportedImage(String path) {
+    return const {
+      '.png',
+      '.jpg',
+      '.jpeg',
+      '.webp',
+      '.bmp',
+    }.contains(p.extension(path).toLowerCase());
+  }
+
+  String _assetRefreshMessage(
+    List<StoryboardCutAsset> assets,
+    List<StoryboardFolder> folders,
+    int deleted,
+    int cleanedEmptyDirectories,
+  ) {
+    final folderAssetCount = folders.fold<int>(
+      0,
+      (total, folder) => total + folder.assets.length,
+    );
+    if (assets.isEmpty && folderAssetCount == 0 && folders.isEmpty) {
+      return '还没有裁切资源，请先导出多宫格图片';
+    }
+    final parts = [
+      '已加载 ${assets.length} 张裁切图片',
+      if (folders.isNotEmpty) '${folders.length} 个文件夹 / $folderAssetCount 张图片',
+      if (deleted > 0) '已清理 $deleted 条失效记录',
+      if (cleanedEmptyDirectories > 0) '已清理 $cleanedEmptyDirectories 个空文件夹',
+    ];
+    return parts.join('，');
+  }
+
+  List<StoryboardResourceGroup> _pruneResourceGroups(
+    List<StoryboardResourceGroup> groups,
+    List<StoryboardCutAsset> assets,
+    List<StoryboardFolder> folders,
+  ) {
+    final validAssetIds = {
+      for (final asset in assets) asset.id,
+      for (final folder in folders)
+        for (final asset in folder.assets) asset.id,
+    };
+    final validSourceImageIds = {for (final asset in assets) asset.imageId};
+    final validFolderIds = {for (final folder in folders) folder.id};
+    return [
+      for (final group in groups)
+        group.copyWith(
+          assetIds: [
+            for (final assetId in group.assetIds)
+              if (validAssetIds.contains(assetId)) assetId,
+          ],
+          sourceImageIds: [
+            for (final sourceImageId in group.sourceImageIds)
+              if (validSourceImageIds.contains(sourceImageId)) sourceImageId,
+          ],
+          folderIds: [
+            for (final folderId in group.folderIds)
+              if (validFolderIds.contains(folderId)) folderId,
+          ],
+        ),
+    ].where((group) => !group.isEmpty).toList();
+  }
+
+  StoryboardResourceGroup _resourceGroupWithout(
+    StoryboardResourceGroup group, {
+    required Set<String> assetIds,
+    required Set<String> sourceImageIds,
+    required Set<String> folderIds,
+  }) {
+    return group.copyWith(
+      assetIds: [
+        for (final assetId in group.assetIds)
+          if (!assetIds.contains(assetId)) assetId,
+      ],
+      sourceImageIds: [
+        for (final sourceImageId in group.sourceImageIds)
+          if (!sourceImageIds.contains(sourceImageId)) sourceImageId,
+      ],
+      folderIds: [
+        for (final folderId in group.folderIds)
+          if (!folderIds.contains(folderId)) folderId,
+      ],
+    );
+  }
+
+  String _uniqueResourceGroupName(String name) {
+    final existingNames = value.resourceGroups
+        .map((group) => group.name)
+        .toSet();
+    var candidate = name;
+    var index = 2;
+    while (existingNames.contains(candidate)) {
+      candidate = '$name $index';
+      index++;
+    }
+    return candidate;
+  }
+
+  int _cleanEmptyCutDirectories() {
+    final cuts = _directories?.cuts;
+    if (cuts == null) {
+      return 0;
+    }
+    return const EmptyDirectoryCleaner().cleanChildren(cuts);
+  }
+
+  List<String> _rowCaptionsForRows(StoryboardBoard board, int rows) {
+    return [
+      for (var rowIndex = 0; rowIndex < rows; rowIndex++)
+        rowIndex < board.rowCaptions.length ? board.rowCaptions[rowIndex] : '',
+    ];
+  }
+
+  List<StoryboardItem> _orderedVisibleItems(StoryboardBoard board) {
+    return [
+      for (final item in board.items)
+        if (item.slotIndex >= 0 && item.slotIndex < board.slotCount) item,
+    ]..sort((a, b) => a.slotIndex.compareTo(b.slotIndex));
+  }
+
+  StoryboardBoard? _boardById(String boardId) {
+    for (final board in value.boards) {
+      if (board.id == boardId) {
+        return board;
+      }
+    }
+    return null;
+  }
+
+  bool _visionBatchMatchesCurrentItems(
+    List<StoryboardItem> items,
+    List<VisionAnalysisItemRecord> records,
+  ) {
+    if (items.length != records.length) {
+      return false;
+    }
+    final assetIds = items.map((item) => item.asset.id).toSet();
+    final recordIds = records.map((record) => record.cutResultId).toSet();
+    return assetIds.length == items.length &&
+        recordIds.length == records.length &&
+        assetIds.containsAll(recordIds) &&
+        recordIds.containsAll(assetIds);
+  }
+
+  Future<VisionAnalysisBatchRecord?> _visionOrderingBatchForBoard({
+    required StoryboardBoard board,
+    required List<StoryboardItem> orderedItems,
+    required int operationToken,
+  }) async {
+    final existingBatch = _database.getLatestVisionAnalysisBatchForBoard(
+      board.id,
+    );
+    if (_visionBatchReadyForOrdering(orderedItems, existingBatch)) {
+      return existingBatch;
+    }
+
+    value = value.copyWith(message: '正在补全专业视觉解析后自动重排序...');
+    _database.deleteVisionAnalysisForBoard(board.id);
+    await _analyzeBoardWithVision(
+      boardId: board.id,
+      operationToken: operationToken,
+      triggeredByReorder: true,
+    );
+    if (_isVisionOperationCancelled(operationToken)) {
+      return null;
+    }
+
+    final currentBoard = _boardById(board.id);
+    if (currentBoard == null) {
+      value = value.copyWith(message: '目标画板已不存在，请重新自动重排序');
+      return null;
+    }
+    final currentItems = _orderedVisibleItems(currentBoard);
+    if (currentItems.length < 2) {
+      value = value.copyWith(message: '至少需要 2 张图片才能自动重排序');
+      return null;
+    }
+
+    final refreshedBatch = _database.getLatestVisionAnalysisBatchForBoard(
+      currentBoard.id,
+    );
+    if (_visionBatchReadyForOrdering(currentItems, refreshedBatch)) {
+      return refreshedBatch;
+    }
+    if (refreshedBatch == null || refreshedBatch.items.isEmpty) {
+      value = value.copyWith(message: '自动重排序前解析失败，请检查视觉模型配置后重试');
+      return null;
+    }
+    if (!_visionBatchMatchesCurrentItems(currentItems, refreshedBatch.items)) {
+      value = value.copyWith(message: '自动解析未完整覆盖当前画板图片，请重试自动重排序');
+      return null;
+    }
+    value = value.copyWith(message: '解析结果仍缺少专业排序维度，请重新自动解析后再重排序');
+    return null;
+  }
+
+  Future<VisionAnalysisBatchRecord?> _visionPromptBatchForCurrentBoard({
+    required StoryboardBoard board,
+    required List<StoryboardItem> orderedItems,
+    required int operationToken,
+  }) async {
+    final existingBatch = _database.getLatestVisionAnalysisBatchForBoard(
+      board.id,
+    );
+    if (_visionBatchReadyForPrompt(orderedItems, existingBatch)) {
+      return existingBatch;
+    }
+
+    value = value.copyWith(message: '正在补全故事板视觉解析后生成自动提示词...');
+    await _analyzeBoardWithVision(
+      boardId: board.id,
+      operationToken: operationToken,
+      triggeredByPrompt: true,
+    );
+    if (_isVisionOperationCancelled(operationToken)) {
+      return null;
+    }
+
+    final currentBoard = _boardById(board.id);
+    if (currentBoard == null) {
+      value = value.copyWith(message: '目标画板已不存在，请重新生成自动提示词');
+      return null;
+    }
+    final currentItems = _orderedVisibleItems(currentBoard);
+    if (currentItems.isEmpty) {
+      value = value.copyWith(message: '当前画板没有可解析的图片');
+      return null;
+    }
+
+    final refreshedBatch = _database.getLatestVisionAnalysisBatchForBoard(
+      currentBoard.id,
+    );
+    if (_visionBatchReadyForPrompt(currentItems, refreshedBatch)) {
+      return refreshedBatch;
+    }
+    if (refreshedBatch == null || refreshedBatch.items.isEmpty) {
+      value = value.copyWith(message: '自动提示词前解析失败，请检查视觉模型配置后重试');
+      return null;
+    }
+    if (!_visionBatchMatchesCurrentItems(currentItems, refreshedBatch.items)) {
+      value = value.copyWith(message: '自动解析未完整覆盖当前画板图片，请重新生成自动提示词');
+      return null;
+    }
+    value = value.copyWith(message: '解析结果缺少多维度内容，请重新自动解析后再生成提示词');
+    return null;
+  }
+
+  bool _visionBatchReadyForOrdering(
+    List<StoryboardItem> items,
+    VisionAnalysisBatchRecord? batch,
+  ) {
+    return batch != null &&
+        batch.items.isNotEmpty &&
+        _visionBatchMatchesCurrentItems(items, batch.items) &&
+        _visionBatchHasOrderingCues(batch.items);
+  }
+
+  bool _visionBatchReadyForPrompt(
+    List<StoryboardItem> items,
+    VisionAnalysisBatchRecord? batch,
+  ) {
+    return batch != null &&
+        batch.items.isNotEmpty &&
+        _visionBatchMatchesCurrentItems(items, batch.items) &&
+        _visionBatchHasPromptContext(batch.items);
+  }
+
+  bool _visionBatchHasOrderingCues(List<VisionAnalysisItemRecord> records) {
+    return records.every((record) {
+      return record.shotSize.trim().isNotEmpty ||
+          record.composition.trim().isNotEmpty ||
+          record.subjectDirection.trim().isNotEmpty ||
+          record.gazeDirection.trim().isNotEmpty ||
+          record.actionStage.trim().isNotEmpty ||
+          record.spatialRelation.trim().isNotEmpty ||
+          record.chronologyCue.trim().isNotEmpty ||
+          record.visualFocus.trim().isNotEmpty ||
+          record.narrativeFunction.trim().isNotEmpty ||
+          record.transitionHint.trim().isNotEmpty;
+    });
+  }
+
+  bool _visionBatchHasPromptContext(List<VisionAnalysisItemRecord> records) {
+    return records.every((record) {
+      final fields = [
+        record.scene,
+        record.props,
+        record.people,
+        record.expression,
+        record.bodyAction,
+        record.movementTrend,
+        record.shotSize,
+        record.composition,
+        record.subjectDirection,
+        record.gazeDirection,
+        record.actionStage,
+        record.spatialRelation,
+        record.chronologyCue,
+        record.cameraAngle,
+        record.visualFocus,
+        record.lightingMood,
+        record.colorPalette,
+        record.narrativeFunction,
+        record.transitionHint,
+      ];
+      return record.detail.trim().isNotEmpty &&
+          fields.any((field) => field.trim().isNotEmpty);
+    });
+  }
+
+  List<_VisionAnalysisRecordItem> _visionRecordItemsInCurrentOrder(
+    List<StoryboardItem> orderedItems,
+    List<VisionAnalysisItemRecord> records,
+  ) {
+    final recordByAssetId = {
+      for (final record in records) record.cutResultId: record,
+    };
+    final result = <_VisionAnalysisRecordItem>[];
+    for (final item in orderedItems) {
+      final record = recordByAssetId[item.asset.id];
+      if (record == null) {
+        continue;
+      }
+      result.add(
+        _VisionAnalysisRecordItem(
+          record: record,
+          analysis: _analysisFromVisionRecord(record),
+        ),
+      );
+    }
+    return result;
+  }
+
+  StoryboardSummary _summaryForPrompt(
+    StoryboardBoard board,
+    List<VisionImageAnalysis> analyses,
+  ) {
+    final boardSummary = board.summary;
+    if (boardSummary != null && !boardSummary.isEmpty) {
+      return boardSummary;
+    }
+    final record = _database.getStoryboardSummary(board.id);
+    if (record != null) {
+      final summary = StoryboardSummary(
+        outline: record.outline,
+        content: record.content,
+        scenes: record.scenes,
+        props: record.props,
+      );
+      if (!summary.isEmpty) {
+        return summary;
+      }
+    }
+    return _fallbackSummaryForAnalyses(analyses);
+  }
+
+  String _storyboardSummaryText(StoryboardSummary summary) {
+    return [
+      if (summary.outline.trim().isNotEmpty) summary.outline.trim(),
+      if (summary.content.trim().isNotEmpty) summary.content.trim(),
+      if (summary.scenes.trim().isNotEmpty) '场景：${summary.scenes.trim()}',
+      if (summary.props.trim().isNotEmpty) '道具：${summary.props.trim()}',
+    ].join('\n');
+  }
+
+  bool _sameItemOrder(List<StoryboardItem> before, List<StoryboardItem> after) {
+    if (before.length != after.length) {
+      return false;
+    }
+    for (var i = 0; i < before.length; i++) {
+      if (before[i].asset.id != after[i].asset.id) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  List<String> _emptyRowCaptions(int rows) {
+    return [for (var rowIndex = 0; rowIndex < rows; rowIndex++) ''];
+  }
+
+  void _applyVisionResults({
+    required String boardId,
+    required List<_AnalyzedStoryboardItem> analyzedItems,
+    required StoryboardSummary? summary,
+    required String message,
+  }) {
+    StoryboardBoard? currentBoard;
+    for (final board in value.boards) {
+      if (board.id == boardId) {
+        currentBoard = board;
+        break;
+      }
+    }
+    if (currentBoard == null) {
+      value = value.copyWith(
+        isAnalyzing: false,
+        isCancellingAnalysis: false,
+        message: message,
+      );
+      return;
+    }
+    if (currentBoard.locked) {
+      value = value.copyWith(
+        isAnalyzing: false,
+        isCancellingAnalysis: false,
+        message: '${currentBoard.name} 已锁定，未写回解析文本',
+      );
+      return;
+    }
+    final bySlot = {
+      for (final item in analyzedItems) item.slotIndex: item.analysis,
+    };
+    final nextItems = [
+      for (final item in currentBoard.items)
+        item.copyWith(caption: bySlot[item.slotIndex]?.caption ?? item.caption),
+    ];
+    final rowCaptions = _rowCaptionsForRows(currentBoard, currentBoard.rows);
+    if (currentBoard.rowDescriptionEnabled) {
+      for (var rowIndex = 0; rowIndex < currentBoard.rows; rowIndex++) {
+        final rowItems =
+            analyzedItems.where((item) => item.rowIndex == rowIndex).toList()
+              ..sort((a, b) => a.columnIndex.compareTo(b.columnIndex));
+        rowCaptions[rowIndex] = composeVisionAnalysesDescription(
+          rowItems.map((item) => item.analysis).toList(),
+        );
+      }
+    }
+    _replaceBoard(
+      currentBoard.copyWith(
+        items: nextItems,
+        rowCaptions: rowCaptions,
+        summary: summary,
+      ),
+      message: message,
+      isAnalyzing: false,
+      selectBoard: value.selectedBoardId == currentBoard.id,
+    );
+  }
+
+  VisionImageAnalysis _analysisFromVisionRecord(
+    VisionAnalysisItemRecord record,
+  ) {
+    return VisionImageAnalysis(
+      caption: normalizeVisionModelRoleTerms(record.caption),
+      detail: normalizeVisionModelRoleTerms(record.detail),
+      scene: normalizeVisionModelRoleTerms(record.scene),
+      props: normalizeVisionModelRoleTerms(record.props),
+      people: normalizeVisionModelRoleTerms(record.people),
+      expression: normalizeVisionModelRoleTerms(record.expression),
+      bodyAction: normalizeVisionModelRoleTerms(record.bodyAction),
+      movementTrend: normalizeVisionModelRoleTerms(record.movementTrend),
+      cameraMovement: normalizeVisionModelRoleTerms(record.cameraMovement),
+      shotSize: normalizeVisionModelRoleTerms(record.shotSize),
+      composition: normalizeVisionModelRoleTerms(record.composition),
+      subjectDirection: normalizeVisionModelRoleTerms(record.subjectDirection),
+      gazeDirection: normalizeVisionModelRoleTerms(record.gazeDirection),
+      actionStage: normalizeVisionModelRoleTerms(record.actionStage),
+      spatialRelation: normalizeVisionModelRoleTerms(record.spatialRelation),
+      chronologyCue: normalizeVisionModelRoleTerms(record.chronologyCue),
+      cameraAngle: normalizeVisionModelRoleTerms(record.cameraAngle),
+      visualFocus: normalizeVisionModelRoleTerms(record.visualFocus),
+      lightingMood: normalizeVisionModelRoleTerms(record.lightingMood),
+      colorPalette: normalizeVisionModelRoleTerms(record.colorPalette),
+      narrativeFunction: normalizeVisionModelRoleTerms(
+        record.narrativeFunction,
+      ),
+      transitionHint: normalizeVisionModelRoleTerms(record.transitionHint),
+      rawResponse: record.rawResponse,
+    );
+  }
+
+  StoryboardSummary _fallbackSummaryForAnalyses(
+    List<VisionImageAnalysis> analyses,
+  ) {
+    return StoryboardSummary(
+      outline: composeVisionAnalysesOutline(analyses),
+      content: composeVisionAnalysesDescription(analyses),
+      scenes: _joinedUniqueVisionValues(analyses.map((item) => item.scene)),
+      props: _joinedUniqueVisionValues(analyses.map((item) => item.props)),
+    );
+  }
+
+  String _joinedUniqueVisionValues(Iterable<String> values) {
+    final seen = <String>{};
+    final result = <String>[];
+    for (final raw in values) {
+      for (final part in raw.split(RegExp(r'[、,，]'))) {
+        final value = part.trim();
+        if (value.isEmpty || !seen.add(value)) {
+          continue;
+        }
+        result.add(value);
+      }
+    }
+    return result.join('、');
+  }
+
+  String _visionReorderCompletionMessage({
+    required bool moved,
+    required String captionRewriteError,
+    required int captionRewriteFallbackCount,
+    required String summaryError,
+  }) {
+    const alreadyOptimalMessage = '分镜组合已是最优，无需重新排列';
+    if (captionRewriteError.isEmpty &&
+        captionRewriteFallbackCount == 0 &&
+        summaryError.isEmpty) {
+      return moved ? '自动重排序完成，已更新图片顺序' : alreadyOptimalMessage;
+    }
+    if (captionRewriteError.isEmpty &&
+        captionRewriteFallbackCount > 0 &&
+        summaryError.isEmpty) {
+      const suffix = '连贯文本已自动恢复';
+      return moved ? '自动重排序完成，$suffix' : '$alreadyOptimalMessage，$suffix';
+    }
+    if (captionRewriteError.isNotEmpty && summaryError.isNotEmpty) {
+      return moved ? '自动重排序完成，文本和摘要更新失败' : '$alreadyOptimalMessage，但文本和摘要更新失败';
+    }
+    if (captionRewriteError.isNotEmpty) {
+      return moved ? '自动重排序完成，文本连贯化失败' : '$alreadyOptimalMessage，但文本连贯化失败';
+    }
+    return moved ? '自动重排序完成，摘要生成失败' : '$alreadyOptimalMessage，但摘要生成失败';
+  }
+
+  String _visionCompletionMessage({
+    required int totalCount,
+    required int successCount,
+    required int failedCount,
+    required String captionRewriteError,
+    required int captionRewriteFallbackCount,
+    required String summaryError,
+  }) {
+    if (failedCount == 0 &&
+        captionRewriteError.isEmpty &&
+        captionRewriteFallbackCount == 0 &&
+        summaryError.isEmpty) {
+      return '故事板自动解析完成，已连贯填入 $totalCount 条描述';
+    }
+    if (failedCount == 0 &&
+        captionRewriteError.isEmpty &&
+        captionRewriteFallbackCount > 0 &&
+        summaryError.isEmpty) {
+      return '故事板自动解析完成，连贯文本已自动恢复';
+    }
+    if (failedCount == 0 && captionRewriteError.isNotEmpty) {
+      return '故事板自动解析完成，连贯文本已自动恢复';
+    }
+    if (failedCount == 0 && summaryError.isNotEmpty) {
+      return '解析完成，故事板概述生成失败';
+    }
+    return '解析完成：成功 $successCount 张，失败 $failedCount 张';
+  }
+
+  void _replaceBoard(
+    StoryboardBoard board, {
+    String? message,
+    bool? isAnalyzing,
+    bool? isCancellingAnalysis,
+    int? reorderAnimationToken,
+    bool saveWorkspace = true,
+    bool selectBoard = true,
+  }) {
+    final nextBoard = _boardWithAdaptiveHeight(board);
+    _setState(
+      value.copyWith(
+        boards: [
+          for (final item in value.boards)
+            if (item.id == nextBoard.id) nextBoard else item,
+        ],
+        selectedBoardId: selectBoard ? nextBoard.id : value.selectedBoardId,
+        message: message,
+        isAnalyzing: isAnalyzing,
+        isCancellingAnalysis:
+            isCancellingAnalysis ?? (isAnalyzing == false ? false : null),
+        reorderAnimationToken: reorderAnimationToken,
+      ),
+      saveWorkspace: saveWorkspace,
+    );
+  }
+
+  StoryboardBoard _boardWithAdaptiveHeight(StoryboardBoard board) {
+    final compactBoard = _compactBoardItems(board);
+    final normalizedBoard = compactBoard.portraitMode
+        ? _boardWithGridForItemCount(
+            compactBoard,
+            itemCount: compactBoard.visibleItemCount,
+          )
+        : compactBoard;
+    return normalizedBoard.withAdaptiveHeight();
+  }
+
+  int get _maxSlotCount => _maxGridExtent * _maxGridExtent;
+
+  StoryboardBoard _boardWithGridForItemCount(
+    StoryboardBoard board, {
+    required int itemCount,
+    int? configuredRows,
+    int? configuredColumns,
+  }) {
+    if (board.portraitMode) {
+      final portraitRows = itemCount.clamp(1, _maxSlotCount).toInt();
+      return board.copyWith(
+        rows: portraitRows,
+        columns: 1,
+        rowCaptions: _rowCaptionsForRows(board, portraitRows),
+      );
+    }
+    final baseRows = (configuredRows ?? board.effectiveConfiguredRows)
+        .clamp(1, _maxGridExtent)
+        .toInt();
+    final baseColumns = (configuredColumns ?? board.effectiveConfiguredColumns)
+        .clamp(1, _maxGridExtent)
+        .toInt();
+    final grid = _gridForItemCount(
+      configuredRows: baseRows,
+      configuredColumns: baseColumns,
+      itemCount: itemCount,
+    );
+    return board.copyWith(
+      rows: grid.rows,
+      columns: grid.columns,
+      configuredRows: baseRows,
+      configuredColumns: baseColumns,
+      rowCaptions: _rowCaptionsForRows(board, grid.rows),
+    );
+  }
+
+  ({int rows, int columns}) _gridForItemCount({
+    required int configuredRows,
+    required int configuredColumns,
+    required int itemCount,
+  }) {
+    final safeRows = configuredRows.clamp(1, _maxGridExtent).toInt();
+    final safeColumns = configuredColumns.clamp(1, _maxGridExtent).toInt();
+    final requiredCount = itemCount.clamp(0, _maxSlotCount).toInt();
+    if (requiredCount <= safeRows * safeColumns) {
+      return (rows: safeRows, columns: safeColumns);
+    }
+
+    final presetIndex = StoryboardGridPreset.values.indexWhere(
+      (preset) => preset.rows == safeRows && preset.columns == safeColumns,
+    );
+    if (presetIndex >= 0) {
+      for (
+        var i = presetIndex + 1;
+        i < StoryboardGridPreset.values.length;
+        i++
+      ) {
+        final preset = StoryboardGridPreset.values[i];
+        if (preset.count >= requiredCount) {
+          return (rows: preset.rows, columns: preset.columns);
+        }
+      }
+    }
+
+    final targetAspect = safeRows / safeColumns;
+    double? bestScore;
+    var bestRows = safeRows;
+    var bestColumns = safeColumns;
+    var bestCapacity = _maxSlotCount + 1;
+    for (var rows = 1; rows <= _maxGridExtent; rows++) {
+      for (var columns = 1; columns <= _maxGridExtent; columns++) {
+        final capacity = rows * columns;
+        if (capacity < requiredCount) {
+          continue;
+        }
+        final aspectPenalty =
+            ((rows / columns) - targetAspect).abs() / targetAspect;
+        final spareRatio = (capacity - requiredCount) / requiredCount;
+        final distance =
+            (rows - safeRows).abs() + (columns - safeColumns).abs();
+        final score = aspectPenalty * 4 + spareRatio + distance * 0.02;
+        final shouldReplace =
+            bestScore == null ||
+            score < bestScore - 0.0001 ||
+            ((score - bestScore).abs() <= 0.0001 &&
+                (capacity < bestCapacity ||
+                    (capacity == bestCapacity && columns > bestColumns)));
+        if (!shouldReplace) {
+          continue;
+        }
+        bestScore = score;
+        bestRows = rows;
+        bestColumns = columns;
+        bestCapacity = capacity;
+      }
+    }
+    return (rows: bestRows, columns: bestColumns);
+  }
+
+  List<StoryboardBoard> _removeMissingItemsFromBoards(
+    List<StoryboardBoard> boards,
+    Set<String> validIds,
+  ) {
+    return [
+      for (final board in boards)
+        _boardWithAdaptiveHeight(
+          board.copyWith(
+            items: board.items
+                .where((item) => validIds.contains(item.asset.id))
+                .toList(),
+          ),
+        ),
+    ];
+  }
+
+  void _restoreWorkspaceOrCreateDefault() {
+    final restored = _loadWorkspaceSnapshot();
+    if (restored != null && restored.boards.isNotEmpty) {
+      _setState(restored, saveWorkspace: false, saveSelection: false);
+      return;
+    }
+    final board = _newBoard(1);
+    _setState(
+      value.copyWith(
+        boards: [board],
+        openBoardIds: [board.id],
+        selectedBoardId: board.id,
+        message: '已创建 ${board.name}',
+      ),
+    );
+    flushWorkspaceSnapshot();
+  }
+
+  StoryboardBoard _newBoard(int index) {
+    return StoryboardBoard(
+      id: _uuid.v4(),
+      name: '画板 $index',
+      width: 1920,
+      height: StoryboardBoard.heightForLayout(width: 1920, rows: 3, columns: 3),
+      rows: 3,
+      columns: 3,
+      gap: 18,
+      items: const [],
+      rowCaptions: const ['', '', ''],
+    );
+  }
+
+  void _setState(
+    StoryboardState next, {
+    bool saveWorkspace = true,
+    bool saveSelection = true,
+  }) {
+    final selectionChanged = next.selectedBoardId != value.selectedBoardId;
+    value = next;
+    if (saveWorkspace) {
+      _workspaceSaveQueue.markDirty();
+    }
+    if (saveSelection && selectionChanged) {
+      _selectionSaveQueue.markDirty();
+    }
+  }
+
+  void _scheduleWorkspaceSnapshotSave({
+    Duration delay = const Duration(milliseconds: 80),
+  }) {
+    _workspaceSaveQueue.markDirty(delay: delay);
+  }
+
+  void flushWorkspaceSnapshot() {
+    _workspaceSaveQueue
+      ..markDirty(delay: Duration.zero)
+      ..flush();
+    _selectionSaveQueue
+      ..markDirty(delay: Duration.zero)
+      ..flush();
+  }
+
+  StoryboardState? _loadWorkspaceSnapshot() {
+    final raw = _database.getSetting(_workspaceSnapshotKey);
+    if (raw == null || raw.trim().isEmpty) {
+      return null;
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, Object?>) {
+        return null;
+      }
+      final boardValues = decoded['boards'];
+      if (boardValues is! List) {
+        return null;
+      }
+      final boards = <StoryboardBoard>[];
+      for (final boardValue in boardValues) {
+        final board = _boardFromJson(boardValue);
+        if (board != null) {
+          boards.add(board.withAdaptiveHeight());
+        }
+      }
+      if (boards.isEmpty) {
+        return null;
+      }
+      final boardGroups = _boardGroupsFromJson(decoded['boardGroups']);
+      final validGroupIds = boardGroups.map((group) => group.id).toSet();
+      final normalizedBoards = [
+        for (final board in boards)
+          validGroupIds.contains(board.groupId)
+              ? board
+              : board.copyWith(groupId: null),
+      ];
+      final boardIds = normalizedBoards.map((board) => board.id).toSet();
+      final storedOpenBoardIds = decoded['openBoardIds'];
+      final openBoardIds = <String>[];
+      if (storedOpenBoardIds is List) {
+        for (final rawId in storedOpenBoardIds) {
+          final id = rawId?.toString();
+          if (id != null &&
+              boardIds.contains(id) &&
+              !openBoardIds.contains(id)) {
+            openBoardIds.add(id);
+          }
+        }
+      } else {
+        openBoardIds.addAll(normalizedBoards.map((board) => board.id));
+      }
+      final lightweightSelection = _database.getSetting(_selectionStateKey);
+      final selectedBoardId = lightweightSelection?.trim().isNotEmpty == true
+          ? lightweightSelection
+          : decoded['selectedBoardId']?.toString();
+      final restoredSelectedBoardId =
+          selectedBoardId != null && openBoardIds.contains(selectedBoardId)
+          ? selectedBoardId
+          : openBoardIds.isEmpty
+          ? null
+          : openBoardIds.first;
+      return StoryboardState(
+        assets: value.assets,
+        folders: value.folders,
+        resourceGroups: _resourceGroupsFromJson(decoded['resourceGroups']),
+        boards: normalizedBoards.map(_boardWithAdaptiveHeight).toList(),
+        boardGroups: boardGroups,
+        openBoardIds: openBoardIds,
+        selectedBoardId: restoredSelectedBoardId,
+        message: '已恢复上次画板状态',
+        isAnalyzing: false,
+        isCancellingAnalysis: false,
+        isGeneratingImage: false,
+        reorderAnimationToken: 0,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Map<String, Object?> _workspaceSnapshotToJson(StoryboardState state) {
+    return {
+      'version': _workspaceSnapshotVersion,
+      'selectedBoardId': state.selectedBoardId,
+      'openBoardIds': state.openBoardIds,
+      'boardGroups': [
+        for (final group in state.boardGroups) _boardGroupToJson(group),
+      ],
+      'resourceGroups': [
+        for (final group in state.resourceGroups) _resourceGroupToJson(group),
+      ],
+      'boards': [
+        for (final board in state.boards)
+          _boardToJson(_compactBoardItems(board)),
+      ],
+    };
+  }
+
+  Map<String, Object?> _resourceGroupToJson(StoryboardResourceGroup group) {
+    return {
+      'id': group.id,
+      'name': group.name,
+      'assetIds': group.assetIds,
+      'sourceImageIds': group.sourceImageIds,
+      'folderIds': group.folderIds,
+      'expanded': group.expanded,
+    };
+  }
+
+  Map<String, Object?> _boardGroupToJson(StoryboardBoardGroup group) {
+    return {'id': group.id, 'name': group.name};
+  }
+
+  Map<String, Object?> _boardToJson(StoryboardBoard board) {
+    return {
+      'id': board.id,
+      'name': board.name,
+      'width': board.width,
+      'height': board.height,
+      'rows': board.rows,
+      'columns': board.columns,
+      'configuredRows': board.configuredRows,
+      'configuredColumns': board.configuredColumns,
+      'gap': board.gap,
+      'storyDescriptionEnabled': board.storyDescriptionEnabled,
+      'rowDescriptionEnabled': board.rowDescriptionEnabled,
+      'captionFontFamily': board.captionFontFamily,
+      'captionFontSize': board.captionFontSize,
+      'rowCaptions': board.rowCaptions,
+      'rowDividerEnabled': board.rowDividerEnabled,
+      'rowDividerStyle': board.rowDividerStyle.name,
+      'rowDividerOpacity': board.rowDividerOpacity,
+      'titleAlignment': board.titleAlignment.name,
+      'portraitMode': board.portraitMode,
+      'locked': board.locked,
+      'groupId': board.groupId,
+      'summary': board.summary == null
+          ? null
+          : {
+              'outline': board.summary!.outline,
+              'content': board.summary!.content,
+              'scenes': board.summary!.scenes,
+              'props': board.summary!.props,
+            },
+      'items': [for (final item in board.items) _itemToJson(item)],
+    };
+  }
+
+  Map<String, Object?> _itemToJson(StoryboardItem item) {
+    return {
+      'caption': item.caption,
+      'slotIndex': item.slotIndex,
+      'flipHorizontal': item.flipHorizontal,
+      'flipVertical': item.flipVertical,
+      'asset': {
+        'id': item.asset.id,
+        'imageId': item.asset.imageId,
+        'sourceName': item.asset.sourceName,
+        'path': _toStoredPath(item.asset.path),
+        'indexNo': item.asset.indexNo,
+      },
+    };
+  }
+
+  StoryboardBoard? _boardFromJson(Object? value) {
+    if (value is! Map<String, Object?>) {
+      return null;
+    }
+    final portraitMode = _jsonBool(value['portraitMode'], false);
+    final rows = _jsonInt(
+      value['rows'],
+      3,
+    ).clamp(1, portraitMode ? _maxSlotCount : _maxGridExtent).toInt();
+    final columns = _jsonInt(value['columns'], 3).clamp(1, 12).toInt();
+    final configuredRows = _jsonNullableInt(
+      value['configuredRows'],
+    )?.clamp(1, 12).toInt();
+    final configuredColumns = _jsonNullableInt(
+      value['configuredColumns'],
+    )?.clamp(1, 12).toInt();
+    final rowCaptions = _jsonStringList(value['rowCaptions']);
+    final items = _jsonItems(value['items']);
+    final normalizedRows = portraitMode ? math.max(1, items.length) : rows;
+    final normalizedColumns = portraitMode ? 1 : columns;
+    final board = StoryboardBoard(
+      id: _jsonString(value['id'], _uuid.v4()),
+      name: _jsonString(value['name'], '画板'),
+      width: _jsonInt(value['width'], 1920).clamp(320, 12000).toInt(),
+      height: _jsonInt(
+        value['height'],
+        StoryboardBoard.heightForLayout(
+          width: 1920,
+          rows: rows,
+          columns: columns,
+        ),
+      ),
+      rows: normalizedRows,
+      columns: normalizedColumns,
+      gap: _jsonDouble(value['gap'], 18).clamp(0, 80).toDouble(),
+      items: items,
+      configuredRows: configuredRows ?? (portraitMode ? rows : null),
+      configuredColumns: configuredColumns ?? (portraitMode ? columns : null),
+      storyDescriptionEnabled: _jsonBool(
+        value['storyDescriptionEnabled'],
+        true,
+      ),
+      rowDescriptionEnabled: _jsonBool(value['rowDescriptionEnabled'], false),
+      captionFontFamily: _jsonString(
+        value['captionFontFamily'],
+        'Microsoft YaHei UI',
+      ),
+      captionFontSize: _jsonDouble(
+        value['captionFontSize'],
+        22,
+      ).clamp(12, 48).toDouble(),
+      rowCaptions: [
+        for (var rowIndex = 0; rowIndex < normalizedRows; rowIndex++)
+          rowIndex < rowCaptions.length ? rowCaptions[rowIndex] : '',
+      ],
+      rowDividerEnabled: _jsonBool(value['rowDividerEnabled'], true),
+      rowDividerStyle: StoryboardDividerStyle.values.firstWhere(
+        (style) => style.name == value['rowDividerStyle']?.toString(),
+        orElse: () => StoryboardDividerStyle.dashed,
+      ),
+      rowDividerOpacity: _jsonDouble(
+        value['rowDividerOpacity'],
+        0.35,
+      ).clamp(0.05, 1.0).toDouble(),
+      titleAlignment: StoryboardTitleAlignment.values.firstWhere(
+        (alignment) => alignment.name == value['titleAlignment']?.toString(),
+        orElse: () => StoryboardTitleAlignment.center,
+      ),
+      portraitMode: portraitMode,
+      locked: _jsonBool(value['locked'], false),
+      groupId: _jsonNullableString(value['groupId']),
+      summary: _summaryFromJson(value['summary']),
+    );
+    return portraitMode ? board.withAdaptiveHeight() : board;
+  }
+
+  List<StoryboardItem> _jsonItems(Object? value) {
+    if (value is! List) {
+      return const [];
+    }
+    final items = <StoryboardItem>[];
+    for (final itemValue in value) {
+      final item = _itemFromJson(itemValue);
+      if (item != null) {
+        items.add(item);
+      }
+    }
+    return items;
+  }
+
+  List<StoryboardResourceGroup> _resourceGroupsFromJson(Object? value) {
+    if (value is! List) {
+      return const [];
+    }
+    final groups = <StoryboardResourceGroup>[];
+    for (final item in value) {
+      if (item is! Map<String, Object?>) {
+        continue;
+      }
+      final id = _jsonString(item['id'], '');
+      final name = _jsonString(item['name'], '');
+      if (id.isEmpty || name.trim().isEmpty) {
+        continue;
+      }
+      final group = StoryboardResourceGroup(
+        id: id,
+        name: name,
+        assetIds: _jsonStringList(item['assetIds']),
+        sourceImageIds: _jsonStringList(item['sourceImageIds']),
+        folderIds: _jsonStringList(item['folderIds']),
+        expanded: _jsonBool(item['expanded'], true),
+      );
+      if (!group.isEmpty) {
+        groups.add(group);
+      }
+    }
+    return groups;
+  }
+
+  List<StoryboardBoardGroup> _boardGroupsFromJson(Object? value) {
+    if (value is! List) {
+      return const [];
+    }
+    final groups = <StoryboardBoardGroup>[];
+    final usedNames = <String>{};
+    for (final item in value) {
+      if (item is! Map<String, Object?>) {
+        continue;
+      }
+      final id = _jsonString(item['id'], '').trim();
+      final name = _jsonString(item['name'], '').trim();
+      final normalizedName = name.toLowerCase();
+      if (id.isEmpty || name.isEmpty || usedNames.contains(normalizedName)) {
+        continue;
+      }
+      usedNames.add(normalizedName);
+      groups.add(StoryboardBoardGroup(id: id, name: name));
+    }
+    return groups;
+  }
+
+  StoryboardItem? _itemFromJson(Object? value) {
+    if (value is! Map<String, Object?>) {
+      return null;
+    }
+    final assetValue = value['asset'];
+    if (assetValue is! Map<String, Object?>) {
+      return null;
+    }
+    final assetId = _jsonString(assetValue['id'], '');
+    final storedPath = _jsonString(assetValue['path'], '');
+    final path = _toRuntimePath(storedPath);
+    if (assetId.isEmpty || path.isEmpty) {
+      return null;
+    }
+    return StoryboardItem(
+      asset: StoryboardCutAsset(
+        id: assetId,
+        imageId: _jsonString(assetValue['imageId'], assetId),
+        sourceName: _jsonString(assetValue['sourceName'], p.basename(path)),
+        path: path,
+        indexNo: _jsonInt(assetValue['indexNo'], 1),
+      ),
+      caption: _jsonString(value['caption'], ''),
+      slotIndex: _jsonInt(value['slotIndex'], 0),
+      flipHorizontal: _jsonBool(value['flipHorizontal'], false),
+      flipVertical: _jsonBool(value['flipVertical'], false),
+    );
+  }
+
+  String _toStoredPath(String path) {
+    final resolver = _pathResolver;
+    if (resolver == null || path.trim().isEmpty || !p.isAbsolute(path)) {
+      return path;
+    }
+    try {
+      return resolver.toStoredPath(path);
+    } on ArgumentError {
+      return path;
+    }
+  }
+
+  String _toRuntimePath(String path) {
+    final resolver = _pathResolver;
+    if (resolver == null || path.trim().isEmpty || p.isAbsolute(path)) {
+      return path;
+    }
+    return resolver.toRuntimePath(path);
+  }
+
+  StoryboardSummary? _summaryFromJson(Object? value) {
+    if (value is! Map<String, Object?>) {
+      return null;
+    }
+    final summary = StoryboardSummary(
+      outline: _jsonString(value['outline'], ''),
+      content: _jsonString(value['content'], ''),
+      scenes: _jsonString(value['scenes'], ''),
+      props: _jsonString(value['props'], ''),
+    );
+    return summary.isEmpty ? null : summary;
+  }
+
+  StoryboardBoard _compactBoardItems(StoryboardBoard board) {
+    final orderedItems = [
+      for (final item in board.items)
+        if (item.slotIndex >= 0 && item.slotIndex < board.slotCount) item,
+    ]..sort((a, b) => a.slotIndex.compareTo(b.slotIndex));
+    final compactedItems = <StoryboardItem>[];
+    for (final item in orderedItems) {
+      if (compactedItems.length >= board.slotCount) {
+        break;
+      }
+      compactedItems.add(item.copyWith(slotIndex: compactedItems.length));
+    }
+    return board.copyWith(items: compactedItems);
+  }
+
+  String _jsonString(Object? value, String fallback) {
+    if (value is String) {
+      return value;
+    }
+    return value?.toString() ?? fallback;
+  }
+
+  String? _jsonNullableString(Object? value) {
+    final normalized = value?.toString().trim() ?? '';
+    return normalized.isEmpty ? null : normalized;
+  }
+
+  int _jsonInt(Object? value, int fallback) {
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.round();
+    }
+    return int.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+
+  int? _jsonNullableInt(Object? value) {
+    if (value == null) {
+      return null;
+    }
+    if (value is int) {
+      return value;
+    }
+    if (value is num) {
+      return value.round();
+    }
+    return int.tryParse(value.toString());
+  }
+
+  double _jsonDouble(Object? value, double fallback) {
+    if (value is num) {
+      return value.toDouble();
+    }
+    return double.tryParse(value?.toString() ?? '') ?? fallback;
+  }
+
+  bool _jsonBool(Object? value, bool fallback) {
+    if (value is bool) {
+      return value;
+    }
+    if (value is String) {
+      return value.toLowerCase() == 'true';
+    }
+    return fallback;
+  }
+
+  List<String> _jsonStringList(Object? value) {
+    if (value is! List) {
+      return const [];
+    }
+    return [for (final item in value) item?.toString() ?? ''];
+  }
+}
+
+typedef _AssetFileSignature = ({
+  String sourceId,
+  int size,
+  int modifiedMicroseconds,
+});
+
+class _AssetScanEntry {
+  const _AssetScanEntry({required this.id, required this.path});
+
+  final String id;
+  final String path;
+}
+
+class _AssetScanRequest {
+  const _AssetScanRequest({
+    required this.cutResults,
+    required this.storyboardFoldersPath,
+    required this.cutsPath,
+  });
+
+  final List<_AssetScanEntry> cutResults;
+  final String? storyboardFoldersPath;
+  final String? cutsPath;
+}
+
+class _ScannedStoryboardFolder {
+  const _ScannedStoryboardFolder({
+    required this.id,
+    required this.name,
+    required this.path,
+    required this.files,
+  });
+
+  final String id;
+  final String name;
+  final String path;
+  final List<String> files;
+}
+
+class _AssetScanResult {
+  const _AssetScanResult({
+    required this.missingIds,
+    required this.folders,
+    required this.fileSignatures,
+    required this.cleanedEmptyDirectories,
+  });
+
+  final List<String> missingIds;
+  final List<_ScannedStoryboardFolder> folders;
+  final Map<String, _AssetFileSignature> fileSignatures;
+  final int cleanedEmptyDirectories;
+}
+
+_AssetScanResult _scanStoryboardAssets(_AssetScanRequest request) {
+  final missingIds = <String>[];
+  final fileSignatures = <String, _AssetFileSignature>{};
+  for (final entry in request.cutResults) {
+    final signature = _readAssetFileSignature(entry.path, entry.id);
+    if (signature == null) {
+      missingIds.add(entry.id);
+    } else {
+      fileSignatures[entry.path] = signature;
+    }
+  }
+
+  final folders = <_ScannedStoryboardFolder>[];
+  final foldersPath = request.storyboardFoldersPath;
+  if (foldersPath != null) {
+    final root = Directory(foldersPath);
+    if (!root.existsSync()) {
+      root.createSync(recursive: true);
+    }
+    final directories = root.listSync().whereType<Directory>().toList()
+      ..sort((a, b) => p.basename(a.path).compareTo(p.basename(b.path)));
+    for (final directory in directories) {
+      final folderName = p.basename(directory.path);
+      final files =
+          directory
+              .listSync()
+              .whereType<File>()
+              .where((file) => _isSupportedStoryboardImage(file.path))
+              .toList()
+            ..sort((a, b) => p.basename(a.path).compareTo(p.basename(b.path)));
+      final paths = <String>[];
+      for (final file in files) {
+        final fileName = p.basename(file.path);
+        final sourceId = 'folder:$folderName:$fileName';
+        final signature = _readAssetFileSignature(file.path, sourceId);
+        if (signature == null) {
+          continue;
+        }
+        paths.add(file.path);
+        fileSignatures[file.path] = signature;
+      }
+      folders.add(
+        _ScannedStoryboardFolder(
+          id: folderName,
+          name: folderName,
+          path: directory.path,
+          files: paths,
+        ),
+      );
+    }
+  }
+
+  final cutsPath = request.cutsPath;
+  final cleanedEmptyDirectories = cutsPath == null
+      ? 0
+      : const EmptyDirectoryCleaner().cleanChildren(Directory(cutsPath));
+  return _AssetScanResult(
+    missingIds: missingIds,
+    folders: folders,
+    fileSignatures: fileSignatures,
+    cleanedEmptyDirectories: cleanedEmptyDirectories,
+  );
+}
+
+_AssetFileSignature? _readAssetFileSignature(String path, String sourceId) {
+  try {
+    final stat = File(path).statSync();
+    if (stat.type != FileSystemEntityType.file) {
+      return null;
+    }
+    return (
+      sourceId: sourceId,
+      size: stat.size,
+      modifiedMicroseconds: stat.modified.microsecondsSinceEpoch,
+    );
+  } on FileSystemException {
+    return null;
+  }
+}
+
+bool _isSupportedStoryboardImage(String path) {
+  return const {
+    '.png',
+    '.jpg',
+    '.jpeg',
+    '.webp',
+    '.bmp',
+  }.contains(p.extension(path).toLowerCase());
+}
+
+@visibleForTesting
+Set<String> changedStoryboardAssetImagePaths<T>(
+  Map<String, T> previous,
+  Map<String, T> current,
+) {
+  return {
+    for (final path in {...previous.keys, ...current.keys})
+      if (previous[path] != current[path]) path,
+  };
+}
+
+List<int> _readImageSizeInWorker(TransferableTypedData transferable) {
+  final bytes = transferable.materialize().asUint8List();
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) {
+    return const [0, 0];
+  }
+  return [decoded.width, decoded.height];
+}
+
+class _AnalyzedStoryboardItem {
+  const _AnalyzedStoryboardItem({
+    required this.slotIndex,
+    required this.rowIndex,
+    required this.columnIndex,
+    required this.analysis,
+  });
+
+  final int slotIndex;
+  final int rowIndex;
+  final int columnIndex;
+  final VisionImageAnalysis analysis;
+
+  _AnalyzedStoryboardItem copyWith({VisionImageAnalysis? analysis}) {
+    return _AnalyzedStoryboardItem(
+      slotIndex: slotIndex,
+      rowIndex: rowIndex,
+      columnIndex: columnIndex,
+      analysis: analysis ?? this.analysis,
+    );
+  }
+}
+
+class _VisionAnalysisRecordItem {
+  const _VisionAnalysisRecordItem({
+    required this.record,
+    required this.analysis,
+  });
+
+  final VisionAnalysisItemRecord record;
+  final VisionImageAnalysis analysis;
+
+  _VisionAnalysisRecordItem copyWith({VisionImageAnalysis? analysis}) {
+    return _VisionAnalysisRecordItem(
+      record: record,
+      analysis: analysis ?? this.analysis,
+    );
+  }
+}
+
+class _QueuedVisionTask {
+  _QueuedVisionTask(this.task);
+
+  final StoryboardVisionTask task;
+  final Completer<void> completer = Completer<void>();
+}
