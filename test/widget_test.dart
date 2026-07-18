@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1017,6 +1018,10 @@ void main() {
       );
       final image = File('${root.path}${Platform.pathSeparator}frame.png');
       await image.writeAsBytes(base64Decode(_onePixelPng));
+      final invalidDrop = File(
+        '${root.path}${Platform.pathSeparator}notes.txt',
+      );
+      await invalidDrop.writeAsString('not an image');
     });
 
     final imagePath = '${root.path}${Platform.pathSeparator}frame.png';
@@ -1068,6 +1073,7 @@ void main() {
     await tester.pump();
 
     expect(find.byTooltip('修改图片'), findsOneWidget);
+    expect(find.byTooltip('替换图片'), findsOneWidget);
 
     await tester.tap(find.byTooltip('修改图片'));
     await tester.pumpAndSettle();
@@ -1084,7 +1090,45 @@ void main() {
 
     expect(find.byTooltip('修改图片'), findsNothing);
 
+    final dropTargetFinder = find.byKey(
+      const ValueKey('storyboard-replacement-drop-asset-1'),
+    );
+    var dropTarget = tester.widget<DropTarget>(dropTargetFinder);
+    dropTarget.onDragEntered!(
+      DropEventDetails(localPosition: Offset.zero, globalPosition: Offset.zero),
+    );
+    await tester.pump(const Duration(milliseconds: 460));
+    expect(
+      find.byKey(const ValueKey('storyboard-replacement-glow-asset-1')),
+      findsOneWidget,
+    );
+
+    dropTarget = tester.widget<DropTarget>(dropTargetFinder);
+    dropTarget.onDragExited!(
+      DropEventDetails(localPosition: Offset.zero, globalPosition: Offset.zero),
+    );
+    await tester.pump();
+    expect(
+      find.byKey(const ValueKey('storyboard-replacement-glow-asset-1')),
+      findsNothing,
+    );
+    dropTarget = tester.widget<DropTarget>(dropTargetFinder);
+    dropTarget.onDragDone!(
+      DropDoneDetails(
+        files: [DropItemFile('${root.path}${Platform.pathSeparator}notes.txt')],
+        localPosition: Offset.zero,
+        globalPosition: Offset.zero,
+      ),
+    );
+    await tester.pump();
+    expect(find.text('请拖入 PNG、JPG、WEBP 或 BMP 图片'), findsOneWidget);
+    expect(controller.value.selectedBoard!.itemAtSlot(0)!.asset.id, 'asset-1');
+
     await tester.pumpWidget(const SizedBox.shrink());
+    PaintingBinding.instance.imageCache
+      ..clear()
+      ..clearLiveImages();
+    await tester.pump(const Duration(milliseconds: 50));
   });
 
   testWidgets('图片生成弹窗最小化后不取消后台任务', (tester) async {

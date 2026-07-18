@@ -345,6 +345,86 @@ void main() {
     expect(item.flipVertical, isTrue);
   });
 
+  test('手动替换图片会复制到工程目录并保留当前格描述与翻转状态', () async {
+    final root = await Directory.systemTemp.createTemp('storyboard_replace_');
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    final source = File(p.join(root.path, '新镜头.png'));
+    await source.writeAsBytes(img.encodePng(img.Image(width: 4, height: 3)));
+
+    controller.setAssetsUsed([_asset(1)], true);
+    controller.updateCaption(0, '保留当前说明');
+    controller.toggleItemFlipHorizontal(0);
+    final original = controller.value.selectedBoard!.itemAtSlot(0)!;
+
+    final replaced = await controller.replaceItemImage(
+      item: original,
+      imagePath: source.path,
+    );
+
+    expect(replaced, isTrue);
+    final item = controller.value.selectedBoard!.itemAtSlot(0)!;
+    expect(item.asset.id, startsWith('replacement-cut-'));
+    expect(item.asset.path, isNot(source.path));
+    expect(
+      p.isWithin(directories.generatedImages.path, item.asset.path),
+      isTrue,
+    );
+    expect(File(item.asset.path).readAsBytesSync(), source.readAsBytesSync());
+    expect(item.caption, '保留当前说明');
+    expect(item.flipHorizontal, isTrue);
+    expect(controller.value.message, '已替换当前格图片');
+    expect(
+      database.listCutResults().any((record) => record.id == item.asset.id),
+      isTrue,
+    );
+
+    controller.undoSelectedBoard();
+    expect(controller.value.selectedBoard!.itemAtSlot(0)!.asset.id, 'asset-1');
+    controller.redoSelectedBoard();
+    expect(
+      controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
+      item.asset.id,
+    );
+  });
+
+  test('手动替换会拒绝无效图片且不改变当前格', () async {
+    final root = await Directory.systemTemp.createTemp('storyboard_replace_');
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    final invalid = File(p.join(root.path, '损坏图片.png'));
+    await invalid.writeAsString('not-an-image');
+    controller.setAssetsUsed([_asset(1)], true);
+    final original = controller.value.selectedBoard!.itemAtSlot(0)!;
+
+    final replaced = await controller.replaceItemImage(
+      item: original,
+      imagePath: invalid.path,
+    );
+
+    expect(replaced, isFalse);
+    expect(controller.value.selectedBoard!.itemAtSlot(0)!.asset.id, 'asset-1');
+    expect(controller.value.message, contains('不是有效图片'));
+  });
+
   test('故事描述开关、逐行描述和字体设置会写入当前画板', () async {
     final fixture = await _createFixture();
     final controller = fixture.controller;

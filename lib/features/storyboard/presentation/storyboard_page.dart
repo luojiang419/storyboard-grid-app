@@ -45,6 +45,19 @@ enum _FolderContextAction { openDirectory }
 
 enum _ResourceGroupContextAction { rename }
 
+const _replacementImageTypeGroup = XTypeGroup(
+  label: '图片',
+  extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp'],
+);
+
+bool _isReplacementImagePath(String path) => const {
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.bmp',
+}.contains(p.extension(path).toLowerCase());
+
 StoryboardState _storyboardState(StoryboardState state) => state;
 
 bool _sameBoardBarState(StoryboardState previous, StoryboardState next) {
@@ -265,6 +278,17 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
                               onFlipVertical: controller.toggleItemFlipVertical,
                               onEditImage: (item) =>
                                   _showImageEditDialog(controller, item),
+                              onPickReplacementImage: (item) => unawaited(
+                                _pickReplacementImage(controller, item),
+                              ),
+                              onDropReplacementImages: (item, paths) =>
+                                  unawaited(
+                                    _replaceWithDroppedImage(
+                                      controller,
+                                      item,
+                                      paths,
+                                    ),
+                                  ),
                               onCaptionChanged: controller.updateCaption,
                               onRowCaptionChanged: controller.updateRowCaption,
                             ),
@@ -337,6 +361,49 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
         );
       },
     );
+  }
+
+  Future<void> _pickReplacementImage(
+    StoryboardController controller,
+    StoryboardItem item,
+  ) async {
+    try {
+      final file = await openFile(
+        acceptedTypeGroups: const [_replacementImageTypeGroup],
+      );
+      if (file != null) {
+        await controller.replaceItemImage(item: item, imagePath: file.path);
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('选择替换图片失败：$error')));
+      }
+    }
+  }
+
+  Future<void> _replaceWithDroppedImage(
+    StoryboardController controller,
+    StoryboardItem item,
+    Iterable<String> paths,
+  ) async {
+    String? imagePath;
+    for (final path in paths) {
+      if (_isReplacementImagePath(path)) {
+        imagePath = path;
+        break;
+      }
+    }
+    if (imagePath == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('请拖入 PNG、JPG、WEBP 或 BMP 图片')),
+        );
+      }
+      return;
+    }
+    await controller.replaceItemImage(item: item, imagePath: imagePath);
   }
 
   Future<void> _exportBoardImages(StoryboardBoard board) async {
@@ -3434,6 +3501,8 @@ class _StoryboardCanvas extends StatelessWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onPickReplacementImage,
+    required this.onDropReplacementImages,
     required this.onCaptionChanged,
     required this.onRowCaptionChanged,
   });
@@ -3449,6 +3518,9 @@ class _StoryboardCanvas extends StatelessWidget {
   final ValueChanged<int> onFlipHorizontal;
   final ValueChanged<int> onFlipVertical;
   final ValueChanged<StoryboardItem> onEditImage;
+  final ValueChanged<StoryboardItem> onPickReplacementImage;
+  final void Function(StoryboardItem item, Iterable<String> paths)
+  onDropReplacementImages;
   final void Function(int index, String caption) onCaptionChanged;
   final void Function(int rowIndex, String caption) onRowCaptionChanged;
 
@@ -3580,6 +3652,8 @@ class _StoryboardCanvas extends StatelessWidget {
                     onFlipHorizontal: onFlipHorizontal,
                     onFlipVertical: onFlipVertical,
                     onEditImage: onEditImage,
+                    onPickReplacementImage: onPickReplacementImage,
+                    onDropReplacementImages: onDropReplacementImages,
                     onCaptionChanged: onCaptionChanged,
                     onRowCaptionChanged: onRowCaptionChanged,
                   ),
@@ -3601,6 +3675,8 @@ class _StoryboardCanvasViewport extends StatefulWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onPickReplacementImage,
+    required this.onDropReplacementImages,
     required this.onCaptionChanged,
     required this.onRowCaptionChanged,
   });
@@ -3614,6 +3690,9 @@ class _StoryboardCanvasViewport extends StatefulWidget {
   final ValueChanged<int> onFlipHorizontal;
   final ValueChanged<int> onFlipVertical;
   final ValueChanged<StoryboardItem> onEditImage;
+  final ValueChanged<StoryboardItem> onPickReplacementImage;
+  final void Function(StoryboardItem item, Iterable<String> paths)
+  onDropReplacementImages;
   final void Function(int index, String caption) onCaptionChanged;
   final void Function(int rowIndex, String caption) onRowCaptionChanged;
 
@@ -3801,6 +3880,8 @@ class _StoryboardCanvasViewportState extends State<_StoryboardCanvasViewport> {
               onFlipHorizontal: widget.onFlipHorizontal,
               onFlipVertical: widget.onFlipVertical,
               onEditImage: widget.onEditImage,
+              onPickReplacementImage: widget.onPickReplacementImage,
+              onDropReplacementImages: widget.onDropReplacementImages,
               onCaptionChanged: widget.onCaptionChanged,
               onRowCaptionChanged: widget.onRowCaptionChanged,
             ),
@@ -4369,6 +4450,8 @@ class _CanvasGrid extends ConsumerStatefulWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onPickReplacementImage,
+    required this.onDropReplacementImages,
     required this.onCaptionChanged,
     required this.onRowCaptionChanged,
   });
@@ -4384,6 +4467,9 @@ class _CanvasGrid extends ConsumerStatefulWidget {
   final ValueChanged<int> onFlipHorizontal;
   final ValueChanged<int> onFlipVertical;
   final ValueChanged<StoryboardItem> onEditImage;
+  final ValueChanged<StoryboardItem> onPickReplacementImage;
+  final void Function(StoryboardItem item, Iterable<String> paths)
+  onDropReplacementImages;
   final void Function(int index, String caption) onCaptionChanged;
   final void Function(int rowIndex, String caption) onRowCaptionChanged;
 
@@ -4401,6 +4487,7 @@ class _CanvasGridState extends ConsumerState<_CanvasGrid> {
   final _stackKey = GlobalKey();
   int? _dragFromSlot;
   int? _hoverSlot;
+  int? _externalHoverSlot;
   final ValueNotifier<Offset?> _dragTopLeft = ValueNotifier(null);
   Offset? _pendingDragPointerDelta;
   Offset? _dragPointerDelta;
@@ -4438,12 +4525,14 @@ class _CanvasGridState extends ConsumerState<_CanvasGrid> {
       _restoreSelectionState();
       _reorderAnimatedAssetIds = const {};
       _reorderAnimationGeneration++;
+      _externalHoverSlot = null;
     }
     if (oldWidget.reorderAnimationToken != widget.reorderAnimationToken) {
       _startReorderAnimation(oldWidget.board, widget.board);
     }
     if (!oldWidget.board.locked && widget.board.locked) {
       _resetDragState();
+      _externalHoverSlot = null;
       _cancelQuickActionHide();
       _quickActionAssetId = null;
     }
@@ -4744,6 +4833,8 @@ class _CanvasGridState extends ConsumerState<_CanvasGrid> {
                           onFlipVertical: () =>
                               widget.onFlipVertical(selectedItem!.slotIndex),
                           onEditImage: () => widget.onEditImage(selectedItem!),
+                          onPickReplacementImage: () =>
+                              widget.onPickReplacementImage(selectedItem!),
                         ),
                       )
                     : const SizedBox.shrink(),
@@ -4797,41 +4888,72 @@ class _CanvasGridState extends ConsumerState<_CanvasGrid> {
     required double captionFontSize,
   }) {
     final highlighted = _hoverSlot == displaySlot;
-    return _buildAssetDropTarget(
+    final externalHighlighted = _externalHoverSlot == displaySlot;
+    Widget tile = _StoryboardTile(
+      item: item,
+      index: displaySlot,
+      previewLogicalWidth: slotRects[displaySlot].width * widget.previewScale,
+      highlighted: highlighted,
+      showCaption: showCaption,
+      captionHeight: captionHeight,
+      captionFontFamily: widget.board.captionFontFamily,
+      captionFontSize: captionFontSize,
+      selected: _selectedAssetIds.contains(item.asset.id),
+      showImageQuickActions: _quickActionAssetId == item.asset.id,
+      onSelect: () => _selectItem(item.asset.id),
+      onRemove: widget.board.locked
+          ? null
+          : () => widget.onRemove(item.asset.id),
+      captionEnabled: !widget.board.locked,
+      onCaptionChanged: (caption) =>
+          widget.onCaptionChanged(item.slotIndex, caption),
+      imageBuilder: widget.board.locked
+          ? null
+          : (context, child) => _buildDraggableImage(
+              item: item,
+              currentRect: slotRects[displaySlot],
+              slotRects: slotRects,
+              child: child,
+            ),
+    );
+    if (externalHighlighted) {
+      tile = _StoryboardReplacementDropGlow(
+        key: ValueKey('storyboard-replacement-glow-${item.asset.id}'),
+        child: tile,
+      );
+    }
+    final target = _buildAssetDropTarget(
       slotIndex: displaySlot,
       child: Align(
         alignment: Alignment.topCenter,
-        child: SizedBox.expand(
-          child: _StoryboardTile(
-            item: item,
-            index: displaySlot,
-            previewLogicalWidth:
-                slotRects[displaySlot].width * widget.previewScale,
-            highlighted: highlighted,
-            showCaption: showCaption,
-            captionHeight: captionHeight,
-            captionFontFamily: widget.board.captionFontFamily,
-            captionFontSize: captionFontSize,
-            selected: _selectedAssetIds.contains(item.asset.id),
-            showImageQuickActions: _quickActionAssetId == item.asset.id,
-            onSelect: () => _selectItem(item.asset.id),
-            onRemove: widget.board.locked
-                ? null
-                : () => widget.onRemove(item.asset.id),
-            captionEnabled: !widget.board.locked,
-            onCaptionChanged: (caption) =>
-                widget.onCaptionChanged(item.slotIndex, caption),
-            imageBuilder: widget.board.locked
-                ? null
-                : (context, child) => _buildDraggableImage(
-                    item: item,
-                    currentRect: slotRects[displaySlot],
-                    slotRects: slotRects,
-                    child: child,
-                  ),
-          ),
-        ),
+        child: SizedBox.expand(child: tile),
       ),
+    );
+    if (widget.board.locked) {
+      return target;
+    }
+    return DropTarget(
+      key: ValueKey('storyboard-replacement-drop-${item.asset.id}'),
+      onDragEntered: (_) {
+        if (_externalHoverSlot != displaySlot) {
+          setState(() => _externalHoverSlot = displaySlot);
+        }
+      },
+      onDragExited: (_) {
+        if (_externalHoverSlot == displaySlot) {
+          setState(() => _externalHoverSlot = null);
+        }
+      },
+      onDragDone: (details) {
+        if (_externalHoverSlot == displaySlot) {
+          setState(() => _externalHoverSlot = null);
+        }
+        widget.onDropReplacementImages(
+          item,
+          details.files.map((file) => file.path),
+        );
+      },
+      child: target,
     );
   }
 
@@ -5437,6 +5559,84 @@ class _StoryboardReorderPulse extends StatelessWidget {
   }
 }
 
+class _StoryboardReplacementDropGlow extends StatefulWidget {
+  const _StoryboardReplacementDropGlow({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<_StoryboardReplacementDropGlow> createState() =>
+      _StoryboardReplacementDropGlowState();
+}
+
+class _StoryboardReplacementDropGlowState
+    extends State<_StoryboardReplacementDropGlow>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 920),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canvasColors = StoryboardCanvasStyle.of(context);
+    return AnimatedBuilder(
+      animation: _controller,
+      child: widget.child,
+      builder: (context, child) {
+        final pulse = Curves.easeInOut.transform(_controller.value);
+        return Transform.scale(
+          scale: 1 + pulse * 0.008,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(10),
+              boxShadow: [
+                BoxShadow(
+                  color: canvasColors.accent.withValues(
+                    alpha: 0.22 + pulse * 0.2,
+                  ),
+                  blurRadius: 14 + pulse * 14,
+                  spreadRadius: 1 + pulse * 2,
+                ),
+              ],
+            ),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                child!,
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: canvasColors.accent.withValues(
+                          alpha: 0.035 + pulse * 0.045,
+                        ),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: canvasColors.accent.withValues(
+                            alpha: 0.62 + pulse * 0.28,
+                          ),
+                          width: 2,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _SelectedImageToolbarPositioner extends StatelessWidget {
   const _SelectedImageToolbarPositioner({
     required this.rect,
@@ -5444,7 +5644,7 @@ class _SelectedImageToolbarPositioner extends StatelessWidget {
     required this.child,
   });
 
-  static const _width = 142.0;
+  static const _width = 176.0;
   static const _height = 36.0;
 
   final Rect rect;
@@ -5473,6 +5673,7 @@ class _ImageQuickActions extends StatelessWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onPickReplacementImage,
   });
 
   final bool flipHorizontal;
@@ -5480,6 +5681,7 @@ class _ImageQuickActions extends StatelessWidget {
   final VoidCallback onFlipHorizontal;
   final VoidCallback onFlipVertical;
   final VoidCallback onEditImage;
+  final VoidCallback onPickReplacementImage;
 
   @override
   Widget build(BuildContext context) {
@@ -5500,6 +5702,12 @@ class _ImageQuickActions extends StatelessWidget {
               selected: false,
               icon: Icons.auto_fix_high_rounded,
               onPressed: onEditImage,
+            ),
+            _ImageQuickActionButton(
+              tooltip: '替换图片',
+              selected: false,
+              icon: Icons.image_search_rounded,
+              onPressed: onPickReplacementImage,
             ),
             _ImageQuickActionButton(
               tooltip: '水平翻转',

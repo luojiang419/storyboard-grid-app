@@ -1384,6 +1384,71 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     );
   }
 
+  Future<bool> replaceItemImage({
+    required StoryboardItem item,
+    required String imagePath,
+  }) async {
+    final board = value.selectedBoard;
+    if (board == null) {
+      return false;
+    }
+    if (_guardLockedBoard(board, '替换图片')) {
+      return false;
+    }
+    final currentItem = board.itemAtSlot(item.slotIndex);
+    if (currentItem == null || currentItem.asset.id != item.asset.id) {
+      value = value.copyWith(message: '当前格内容已变化，请重新选择后替换');
+      return false;
+    }
+    final directories = _directories;
+    if (directories == null) {
+      value = value.copyWith(message: '数据目录尚未初始化，无法替换图片');
+      return false;
+    }
+    final source = File(imagePath);
+    if (!source.existsSync() || !_isSupportedImage(source.path)) {
+      value = value.copyWith(message: '请选择 PNG、JPG、WEBP 或 BMP 图片');
+      return false;
+    }
+    final size = await _readImageSize(source);
+    if (size.width <= 0 || size.height <= 0) {
+      value = value.copyWith(message: '所选文件不是有效图片，未进行替换');
+      return false;
+    }
+
+    try {
+      final outputDirectory = Directory(
+        p.join(
+          directories.generatedImages.path,
+          board.id,
+          'manual_replacements',
+        ),
+      );
+      await outputDirectory.create(recursive: true);
+      final target = _uniqueFile(outputDirectory, p.basename(source.path));
+      final copied = await source.copy(target.path);
+      final replacement = _registerReplacementImageAsset(
+        originalPath: source.path,
+        resultPath: copied.path,
+        sourceName: '手动替换_${p.basename(source.path)}',
+        size: size,
+        idPrefix: 'replacement',
+        taskStatus: 'manual-replacement',
+      );
+      return _replaceCurrentItemAsset(
+        boardId: board.id,
+        slotIndex: item.slotIndex,
+        oldAssetId: item.asset.id,
+        replacement: replacement,
+        successMessage: '已替换当前格图片',
+        changedMessage: '当前格内容已变化，未进行替换',
+      );
+    } on FileSystemException {
+      value = value.copyWith(message: '复制替换图片失败，请检查文件权限');
+      return false;
+    }
+  }
+
   void setAssetsUsed(Iterable<StoryboardCutAsset> assets, bool used) {
     final board = value.selectedBoard;
     if (board == null) {
@@ -2879,24 +2944,25 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     return source.copy(target.path);
   }
 
-  Future<StoryboardCutAsset> _registerGeneratedImageAsset({
-    required StoryboardCutAsset sourceAsset,
+  StoryboardCutAsset _registerReplacementImageAsset({
+    required String originalPath,
     required String resultPath,
-  }) async {
-    final file = File(resultPath);
-    final size = await _readImageSize(file);
-    final imageId = 'generated-image-${_uuid.v4()}';
-    final taskId = 'generated-task-${_uuid.v4()}';
-    final resultId = 'generated-cut-${_uuid.v4()}';
-    final originalName = 'AI修改_${p.basename(sourceAsset.path)}';
+    required String sourceName,
+    required ({int width, int height}) size,
+    required String idPrefix,
+    required String taskStatus,
+  }) {
+    final imageId = '$idPrefix-image-${_uuid.v4()}';
+    final taskId = '$idPrefix-task-${_uuid.v4()}';
+    final resultId = '$idPrefix-cut-${_uuid.v4()}';
     final now = DateTime.now().toIso8601String();
     final storedPath = _toStoredPath(resultPath);
 
     _database
       ..upsertImportedImage(
         id: imageId,
-        originalPath: sourceAsset.path,
-        originalName: originalName,
+        originalPath: originalPath,
+        originalName: sourceName,
         storedPath: storedPath,
         width: size.width,
         height: size.height,
@@ -2905,7 +2971,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       ..upsertCutTask(
         id: taskId,
         imageId: imageId,
-        status: 'generated',
+        status: taskStatus,
         rows: 1,
         columns: 1,
         confidence: 1,
@@ -2926,9 +2992,26 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     return StoryboardCutAsset(
       id: resultId,
       imageId: imageId,
-      sourceName: originalName,
+      sourceName: sourceName,
       path: resultPath,
       indexNo: 1,
+    );
+  }
+
+  Future<StoryboardCutAsset> _registerGeneratedImageAsset({
+    required StoryboardCutAsset sourceAsset,
+    required String resultPath,
+  }) async {
+    final file = File(resultPath);
+    final size = await _readImageSize(file);
+    final originalName = 'AI修改_${p.basename(sourceAsset.path)}';
+    return _registerReplacementImageAsset(
+      originalPath: sourceAsset.path,
+      resultPath: resultPath,
+      sourceName: originalName,
+      size: size,
+      idPrefix: 'generated',
+      taskStatus: 'generated',
     );
   }
 
@@ -2947,6 +3030,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     required int slotIndex,
     required String oldAssetId,
     required StoryboardCutAsset replacement,
+    String successMessage = '图片修改完成，已替换当前格',
+    String changedMessage = '图片已生成，但当前格内容已变化，未自动替换',
   }) {
     StoryboardBoard? currentBoard;
     for (final board in value.boards) {
@@ -2973,10 +3058,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       (item) => item.slotIndex == slotIndex && item.asset.id == oldAssetId,
     );
     if (itemIndex < 0) {
-      value = value.copyWith(
-        isGeneratingImage: false,
-        message: '图片已生成，但当前格内容已变化，未自动替换',
-      );
+      value = value.copyWith(isGeneratingImage: false, message: changedMessage);
       return false;
     }
 
@@ -2999,7 +3081,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         ],
         selectedBoardId: boardId,
         isGeneratingImage: false,
-        message: '图片修改完成，已替换当前格',
+        message: successMessage,
       ),
     );
     return true;
@@ -4682,12 +4764,16 @@ Set<String> changedStoryboardAssetImagePaths<T>(
 }
 
 List<int> _readImageSizeInWorker(TransferableTypedData transferable) {
-  final bytes = transferable.materialize().asUint8List();
-  final decoded = img.decodeImage(bytes);
-  if (decoded == null) {
+  try {
+    final bytes = transferable.materialize().asUint8List();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) {
+      return const [0, 0];
+    }
+    return [decoded.width, decoded.height];
+  } catch (_) {
     return const [0, 0];
   }
-  return [decoded.width, decoded.height];
 }
 
 class _AnalyzedStoryboardItem {
