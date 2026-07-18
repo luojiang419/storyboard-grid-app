@@ -1440,7 +1440,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         slotIndex: item.slotIndex,
         oldAssetId: item.asset.id,
         replacement: replacement,
-        successMessage: '已替换当前格图片',
+        successMessage: '已替换当前格图片，可撤回/重做（最多100步）',
         changedMessage: '当前格内容已变化，未进行替换',
       );
     } on FileSystemException {

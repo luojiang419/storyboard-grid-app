@@ -382,7 +382,7 @@ void main() {
     expect(File(item.asset.path).readAsBytesSync(), source.readAsBytesSync());
     expect(item.caption, '保留当前说明');
     expect(item.flipHorizontal, isTrue);
-    expect(controller.value.message, '已替换当前格图片');
+    expect(controller.value.message, '已替换当前格图片，可撤回/重做（最多100步）');
     expect(
       database.listCutResults().any((record) => record.id == item.asset.id),
       isTrue,
@@ -395,6 +395,69 @@ void main() {
       controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
       item.asset.id,
     );
+  });
+
+  test('手动替换图片支持100步撤回重做并淘汰更早记录', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'storyboard_replace_history_',
+    );
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    final source = File(p.join(root.path, '连续替换.png'));
+    await source.writeAsBytes(img.encodePng(img.Image(width: 2, height: 2)));
+
+    controller.setAssetsUsed([_asset(1)], true);
+    controller.updateCaption(0, '连续替换仍保留说明');
+    controller.toggleItemFlipVertical(0);
+    final assetIds = <String>[
+      controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
+    ];
+
+    for (var step = 1; step <= 101; step++) {
+      final currentItem = controller.value.selectedBoard!.itemAtSlot(0)!;
+      expect(
+        await controller.replaceItemImage(
+          item: currentItem,
+          imagePath: source.path,
+        ),
+        isTrue,
+        reason: '第 $step 次替换应成功',
+      );
+      final replacedItem = controller.value.selectedBoard!.itemAtSlot(0)!;
+      assetIds.add(replacedItem.asset.id);
+      expect(replacedItem.caption, '连续替换仍保留说明');
+      expect(replacedItem.flipVertical, isTrue);
+    }
+
+    for (var expectedIndex = 100; expectedIndex >= 1; expectedIndex--) {
+      controller.undoSelectedBoard();
+      expect(
+        controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
+        assetIds[expectedIndex],
+      );
+    }
+    expect(controller.canUndoSelectedBoard, isFalse);
+
+    for (var expectedIndex = 2; expectedIndex <= 101; expectedIndex++) {
+      controller.redoSelectedBoard();
+      expect(
+        controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
+        assetIds[expectedIndex],
+      );
+    }
+    expect(controller.canRedoSelectedBoard, isFalse);
+    final finalItem = controller.value.selectedBoard!.itemAtSlot(0)!;
+    expect(finalItem.caption, '连续替换仍保留说明');
+    expect(finalItem.flipVertical, isTrue);
   });
 
   test('手动替换会拒绝无效图片且不改变当前格', () async {
