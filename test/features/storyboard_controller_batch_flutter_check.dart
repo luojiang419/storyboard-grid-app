@@ -409,11 +409,15 @@ void main() {
     expect(replaced, isTrue);
     final item = controller.value.selectedBoard!.itemAtSlot(0)!;
     expect(item.asset.id, startsWith('replacement-cut-'));
+    expect(item.asset.imageId, 'storyboard-manual-replacement-images');
+    expect(item.asset.sourceName, '手动替换');
     expect(item.asset.path, isNot(source.path));
     expect(
       p.isWithin(directories.generatedImages.path, item.asset.path),
       isTrue,
     );
+    expect(p.basename(p.dirname(item.asset.path)), '画板 1-手动替换');
+    expect(p.basename(item.asset.path), '001-画板 1-手动替换.png');
     expect(File(item.asset.path).readAsBytesSync(), source.readAsBytesSync());
     expect(item.caption, '保留当前说明');
     expect(item.flipHorizontal, isTrue);
@@ -429,6 +433,93 @@ void main() {
     expect(
       controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
       item.asset.id,
+    );
+  });
+
+  test('连续手动替换按画板名称归档并合并为单一来源组', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'storyboard_manual_archive_',
+    );
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    final sources = <File>[];
+    for (var index = 1; index <= 3; index++) {
+      final source = File(p.join(root.path, '手动镜头$index.png'));
+      await source.writeAsBytes(
+        img.encodePng(img.Image(width: 3 + index, height: 2 + index)),
+      );
+      sources.add(source);
+    }
+
+    controller.setAssetsUsed([_asset(1)], true);
+    controller.renameSelectedBoard('春日:镜头');
+    for (final source in sources.take(2)) {
+      final current = controller.value.selectedBoard!.itemAtSlot(0)!;
+      expect(
+        await controller.replaceItemImage(
+          item: current,
+          imagePath: source.path,
+        ),
+        isTrue,
+      );
+    }
+    controller.addBoard();
+    controller.renameSelectedBoard('夜景镜头');
+    controller.setAssetsUsed([_asset(2)], true);
+    expect(
+      await controller.replaceItemImage(
+        item: controller.value.selectedBoard!.itemAtSlot(0)!,
+        imagePath: sources.last.path,
+      ),
+      isTrue,
+    );
+    await controller.refreshAssets();
+
+    final replacements = controller.value.assets
+        .where((asset) => asset.id.startsWith('replacement-cut-'))
+        .toList();
+    expect(replacements, hasLength(3));
+    expect(replacements.map((asset) => asset.imageId).toSet(), {
+      'storyboard-manual-replacement-images',
+    });
+    expect(replacements.map((asset) => asset.sourceName).toSet(), {'手动替换'});
+    expect(replacements.map((asset) => asset.indexNo).toList()..sort(), [
+      1,
+      2,
+      3,
+    ]);
+
+    final archive = Directory(
+      p.join(directories.generatedImages.path, '春日_镜头-手动替换'),
+    );
+    final names =
+        archive
+            .listSync()
+            .whereType<File>()
+            .map((file) => p.basename(file.path))
+            .toList()
+          ..sort();
+    expect(names, ['001-春日_镜头-手动替换.png', '002-春日_镜头-手动替换.png']);
+    expect(
+      Directory(
+        p.join(directories.generatedImages.path, '夜景镜头-手动替换'),
+      ).listSync().whereType<File>().map((file) => p.basename(file.path)),
+      ['003-夜景镜头-手动替换.png'],
+    );
+    expect(
+      directories.generatedImages.listSync().whereType<Directory>().map(
+        (directory) => p.basename(directory.path),
+      ),
+      containsAll(['春日_镜头-手动替换', '夜景镜头-手动替换']),
     );
   });
 
@@ -1772,7 +1863,7 @@ void main() {
     );
   });
 
-  test('连续 AI 修改统一归档到单一目录并按画板名称递增编号', () async {
+  test('连续 AI 修改按画板名称归档并合并为单一来源组', () async {
     final fixture = await _createImageGenerationFixture();
     final controller = fixture.controller;
     final asset = await _registeredAsset(fixture.database, fixture.root, 1);
@@ -1794,17 +1885,32 @@ void main() {
         isTrue,
       );
     }
+    controller.addBoard();
+    controller.renameSelectedBoard('夜景镜头');
+    controller.setAssetsUsed([asset], true);
+    expect(
+      await controller.generateReplacementForItem(
+        item: controller.value.selectedBoard!.itemAtSlot(0)!,
+        prompt: '保持构图并调整夜景光线',
+        model: 'nano-banana-fast',
+        aspectRatio: '16:9',
+        imageSize: '2K',
+        quality: 'auto',
+        extraReferenceImagePaths: const [],
+      ),
+      isTrue,
+    );
 
     final generated = controller.value.assets
         .where((asset) => asset.id.startsWith('generated-cut-'))
         .toList();
-    expect(generated, hasLength(2));
+    expect(generated, hasLength(3));
     expect(generated.map((asset) => asset.imageId).toSet(), hasLength(1));
     expect(generated.map((asset) => asset.sourceName).toSet(), {'AI修改'});
-    expect(generated.map((asset) => asset.indexNo), [2, 1]);
+    expect(generated.map((asset) => asset.indexNo).toList()..sort(), [1, 2, 3]);
 
     final archive = Directory(
-      p.join(fixture.directories.generatedImages.path, 'AI修改'),
+      p.join(fixture.directories.generatedImages.path, '春日_镜头-AI修改'),
     );
     final names =
         archive
@@ -1815,12 +1921,18 @@ void main() {
           ..sort();
     expect(names, ['001-春日_镜头-AI修改.png', '002-春日_镜头-AI修改.png']);
     expect(
+      Directory(
+        p.join(fixture.directories.generatedImages.path, '夜景镜头-AI修改'),
+      ).listSync().whereType<File>().map((file) => p.basename(file.path)),
+      ['003-夜景镜头-AI修改.png'],
+    );
+    expect(
       fixture.directories.generatedImages.listSync().whereType<Directory>(),
-      hasLength(1),
+      hasLength(2),
     );
   });
 
-  test('旧版分散 AI 修改结果会迁移到统一目录并合并为一个来源组', () async {
+  test('旧版分散 AI 修改结果仅在确认后归纳并保持画板引用', () async {
     final root = await Directory.systemTemp.createTemp(
       'storyboard_ai_migrate_',
     );
@@ -1835,10 +1947,33 @@ void main() {
       database.dispose();
       await root.delete(recursive: true);
     });
-    await _registerLegacyGeneratedAsset(database, directories, 1);
-    await _registerLegacyGeneratedAsset(database, directories, 2);
+    final boardId = controller.value.selectedBoard!.id;
+    final legacyAssets = [
+      await _registerLegacyGeneratedAsset(
+        database,
+        directories,
+        1,
+        boardId: boardId,
+      ),
+      await _registerLegacyGeneratedAsset(
+        database,
+        directories,
+        2,
+        boardId: boardId,
+      ),
+    ];
+    controller.setAssetsUsed(legacyAssets, true);
 
     await controller.refreshAssets();
+
+    expect(controller.value.assetNormalizationRequired, isTrue);
+    expect(controller.value.legacyAiEditedImageCount, 2);
+    expect(
+      legacyAssets.every((asset) => File(asset.path).existsSync()),
+      isTrue,
+      reason: '启动检测不能在用户确认前移动旧图片',
+    );
+    expect(await controller.normalizeLegacyReplacementAssets(), isTrue);
 
     final generated = controller.value.assets
         .where((asset) => asset.id.startsWith('generated-cut-'))
@@ -1850,14 +1985,123 @@ void main() {
     expect(generated.map((asset) => asset.sourceName).toSet(), {'AI修改'});
     expect(generated.map((asset) => asset.indexNo).toList()..sort(), [1, 2]);
     for (final asset in generated) {
-      expect(p.basename(p.dirname(asset.path)), 'AI修改');
+      expect(p.basename(p.dirname(asset.path)), '画板 1-AI修改');
       expect(File(asset.path).existsSync(), isTrue);
+      final databaseRecord = database.listCutResults().singleWhere(
+        (record) => record.id == asset.id,
+      );
+      expect(databaseRecord.imageId, 'storyboard-ai-edited-images');
+      final generationRecord = database
+          .listImageGenerationRecords()
+          .singleWhere((record) => record.resultAssetId == asset.id);
+      expect(generationRecord.resultPath, databaseRecord.path);
     }
+    expect(database.countRows('imported_images'), 1);
+    expect(controller.value.assetNormalizationRequired, isFalse);
+    expect(
+      controller.value.selectedBoard!.items.map((item) => item.asset.path),
+      containsAll(generated.map((asset) => asset.path)),
+    );
     expect(
       directories.generatedImages.listSync().whereType<Directory>().map(
         (directory) => p.basename(directory.path),
       ),
-      ['AI修改'],
+      ['画板 1-AI修改'],
+    );
+  });
+
+  test('旧版 manual_replacements 会迁移并更新数据库与画板引用', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'storyboard_manual_migrate_',
+    );
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    final boardId = controller.value.selectedBoard!.id;
+    final legacyAssets = [
+      await _registerLegacyManualReplacementAsset(
+        database,
+        directories,
+        boardId,
+        1,
+      ),
+      await _registerLegacyManualReplacementAsset(
+        database,
+        directories,
+        boardId,
+        2,
+      ),
+    ];
+    controller.setAssetsUsed(legacyAssets, true);
+
+    await controller.refreshAssets();
+
+    expect(controller.value.assetNormalizationRequired, isTrue);
+    expect(controller.value.legacyManualReplacementImageCount, 2);
+    expect(
+      legacyAssets.every((asset) => File(asset.path).existsSync()),
+      isTrue,
+      reason: '启动检测不能在用户确认前移动旧图片',
+    );
+    expect(await controller.normalizeLegacyReplacementAssets(), isTrue);
+
+    final replacements = controller.value.assets
+        .where((asset) => asset.id.startsWith('replacement-cut-legacy-'))
+        .toList();
+    expect(replacements, hasLength(2));
+    expect(replacements.map((asset) => asset.imageId).toSet(), {
+      'storyboard-manual-replacement-images',
+    });
+    expect(replacements.map((asset) => asset.sourceName).toSet(), {'手动替换'});
+    expect(replacements.map((asset) => asset.indexNo).toList()..sort(), [1, 2]);
+    expect(database.countRows('imported_images'), 1);
+
+    final expectedDirectory = p.join(
+      directories.generatedImages.path,
+      '画板 1-手动替换',
+    );
+    final expectedNames = <String>{'001-画板 1-手动替换.png', '002-画板 1-手动替换.png'};
+    for (final asset in replacements) {
+      expect(p.dirname(asset.path), expectedDirectory);
+      expect(expectedNames, contains(p.basename(asset.path)));
+      expect(File(asset.path).existsSync(), isTrue);
+      final databaseRecord = database.listCutResults().singleWhere(
+        (record) => record.id == asset.id,
+      );
+      expect(databaseRecord.imageId, 'storyboard-manual-replacement-images');
+      expect(
+        p.normalize(databaseRecord.path),
+        p.normalize(
+          p.join('generated_images', '画板 1-手动替换', p.basename(asset.path)),
+        ),
+      );
+      expect(databaseRecord.indexNo, asset.indexNo);
+    }
+    final boardAssets = controller.value.selectedBoard!.items
+        .map((item) => item.asset)
+        .where((asset) => asset.id.startsWith('replacement-cut-legacy-'))
+        .toList();
+    expect(boardAssets, hasLength(2));
+    expect(boardAssets.map((asset) => asset.path).toSet(), {
+      for (final asset in replacements) asset.path,
+    });
+    expect(
+      Directory(
+        p.join(
+          directories.generatedImages.path,
+          boardId,
+          'manual_replacements',
+        ),
+      ).existsSync(),
+      isFalse,
     );
   });
 
@@ -2038,13 +2282,14 @@ _createImageGenerationFixture({
   );
 }
 
-Future<void> _registerLegacyGeneratedAsset(
+Future<StoryboardCutAsset> _registerLegacyGeneratedAsset(
   AppDatabase database,
   AppDirectories directories,
-  int index,
-) async {
+  int index, {
+  String? boardId,
+}) async {
   final legacyDirectory = Directory(
-    p.join(directories.generatedImages.path, 'legacy-board-$index'),
+    p.join(directories.generatedImages.path, boardId ?? 'legacy-board-$index'),
   );
   await legacyDirectory.create(recursive: true);
   final file = File(p.join(legacyDirectory.path, 'generated-$index.png'));
@@ -2085,6 +2330,92 @@ Future<void> _registerLegacyGeneratedAsset(
       height: 3 + index,
       selected: true,
     );
+  final generationId = 'legacy-generation-$index';
+  database
+    ..insertImageGenerationRecord(
+      id: generationId,
+      boardId: boardId ?? 'legacy-board-$index',
+      slotIndex: index - 1,
+      sourceAssetId: 'source-$index',
+      sourcePath: file.path,
+      model: 'legacy-model',
+      prompt: '旧版修改',
+      aspectRatio: '16:9',
+      imageSize: '1K',
+      quality: 'auto',
+      referencePathsJson: '[]',
+      status: 'running',
+    )
+    ..updateImageGenerationRecord(
+      id: generationId,
+      status: 'success',
+      resultAssetId: assetId,
+      resultPath: file.path,
+    );
+  return StoryboardCutAsset(
+    id: assetId,
+    imageId: imageId,
+    sourceName: 'AI修改_旧图$index.png',
+    path: file.path,
+    indexNo: 1,
+  );
+}
+
+Future<StoryboardCutAsset> _registerLegacyManualReplacementAsset(
+  AppDatabase database,
+  AppDirectories directories,
+  String boardId,
+  int index,
+) async {
+  final legacyDirectory = Directory(
+    p.join(directories.generatedImages.path, boardId, 'manual_replacements'),
+  );
+  await legacyDirectory.create(recursive: true);
+  final file = File(p.join(legacyDirectory.path, 'legacy-$index.png'));
+  await file.writeAsBytes(
+    img.encodePng(img.Image(width: 4 + index, height: 3 + index)),
+  );
+  final imageId = 'legacy-replacement-image-$index';
+  final taskId = 'legacy-replacement-task-$index';
+  final assetId = 'replacement-cut-legacy-$index';
+  final now = DateTime.now().add(Duration(seconds: index)).toIso8601String();
+  database
+    ..upsertImportedImage(
+      id: imageId,
+      originalPath: file.path,
+      originalName: '手动替换_旧图$index.png',
+      storedPath: file.path,
+      width: 4 + index,
+      height: 3 + index,
+      createdAt: now,
+    )
+    ..upsertCutTask(
+      id: taskId,
+      imageId: imageId,
+      status: 'manual-replacement',
+      rows: 1,
+      columns: 1,
+      confidence: 1,
+    )
+    ..insertCutResult(
+      id: assetId,
+      taskId: taskId,
+      imageId: imageId,
+      indexNo: 1,
+      path: file.path,
+      x: 0,
+      y: 0,
+      width: 4 + index,
+      height: 3 + index,
+      selected: true,
+    );
+  return StoryboardCutAsset(
+    id: assetId,
+    imageId: imageId,
+    sourceName: '手动替换_旧图$index.png',
+    path: file.path,
+    indexNo: 1,
+  );
 }
 
 StoryboardCutAsset _asset(int index) {

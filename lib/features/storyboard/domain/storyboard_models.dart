@@ -610,6 +610,10 @@ class StoryboardState {
     required this.isAnalyzing,
     required this.isCancellingAnalysis,
     required this.isGeneratingImage,
+    this.assetNormalizationRequired = false,
+    this.isNormalizingAssets = false,
+    this.legacyAiEditedImageCount = 0,
+    this.legacyManualReplacementImageCount = 0,
     required this.reorderAnimationToken,
     this.activeVisionBoardId,
     this.activeVisionTaskKind,
@@ -629,6 +633,10 @@ class StoryboardState {
       isAnalyzing = false,
       isCancellingAnalysis = false,
       isGeneratingImage = false,
+      assetNormalizationRequired = false,
+      isNormalizingAssets = false,
+      legacyAiEditedImageCount = 0,
+      legacyManualReplacementImageCount = 0,
       reorderAnimationToken = 0,
       activeVisionBoardId = null,
       activeVisionTaskKind = null,
@@ -646,6 +654,10 @@ class StoryboardState {
   final bool isAnalyzing;
   final bool isCancellingAnalysis;
   final bool isGeneratingImage;
+  final bool assetNormalizationRequired;
+  final bool isNormalizingAssets;
+  final int legacyAiEditedImageCount;
+  final int legacyManualReplacementImageCount;
   final int reorderAnimationToken;
   final String? activeVisionBoardId;
   final StoryboardVisionTaskKind? activeVisionTaskKind;
@@ -701,6 +713,10 @@ class StoryboardState {
     bool? isAnalyzing,
     bool? isCancellingAnalysis,
     bool? isGeneratingImage,
+    bool? assetNormalizationRequired,
+    bool? isNormalizingAssets,
+    int? legacyAiEditedImageCount,
+    int? legacyManualReplacementImageCount,
     int? reorderAnimationToken,
     Object? activeVisionBoardId = _copyWithSentinel,
     Object? activeVisionTaskKind = _copyWithSentinel,
@@ -721,6 +737,14 @@ class StoryboardState {
       isAnalyzing: isAnalyzing ?? this.isAnalyzing,
       isCancellingAnalysis: isCancellingAnalysis ?? this.isCancellingAnalysis,
       isGeneratingImage: isGeneratingImage ?? this.isGeneratingImage,
+      assetNormalizationRequired:
+          assetNormalizationRequired ?? this.assetNormalizationRequired,
+      isNormalizingAssets: isNormalizingAssets ?? this.isNormalizingAssets,
+      legacyAiEditedImageCount:
+          legacyAiEditedImageCount ?? this.legacyAiEditedImageCount,
+      legacyManualReplacementImageCount:
+          legacyManualReplacementImageCount ??
+          this.legacyManualReplacementImageCount,
       reorderAnimationToken:
           reorderAnimationToken ?? this.reorderAnimationToken,
       activeVisionBoardId: identical(activeVisionBoardId, _copyWithSentinel)

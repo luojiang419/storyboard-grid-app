@@ -1337,7 +1337,7 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('手动替换_右键取消使用.png'));
+    await tester.tap(find.text('手动替换'));
     await tester.pumpAndSettle();
     final replacementThumb = find.byKey(
       ValueKey('asset-thumb-${replacement.asset.id}'),

@@ -984,6 +984,44 @@ class AppDatabase {
     );
   }
 
+  void reassignCutResultImageSource({
+    required String resultId,
+    required String taskId,
+    required String imageId,
+  }) {
+    _database.execute('BEGIN IMMEDIATE;');
+    try {
+      _database.execute('UPDATE cut_results SET image_id = ? WHERE id = ?;', [
+        imageId,
+        resultId,
+      ]);
+      _database.execute('UPDATE cut_tasks SET image_id = ? WHERE id = ?;', [
+        imageId,
+        taskId,
+      ]);
+      _database.execute('COMMIT;');
+    } catch (_) {
+      _database.execute('ROLLBACK;');
+      rethrow;
+    }
+  }
+
+  void deleteImportedImageIfUnreferenced(String imageId) {
+    _database.execute(
+      '''
+      DELETE FROM imported_images
+      WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM cut_results WHERE image_id = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM cut_tasks WHERE image_id = ?
+        );
+      ''',
+      [imageId, imageId, imageId],
+    );
+  }
+
   void insertVisionAnalysisRun({
     required String id,
     required String boardId,

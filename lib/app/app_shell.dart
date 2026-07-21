@@ -12,6 +12,7 @@ import '../features/onboarding/data/onboarding_repository.dart';
 import '../features/onboarding/presentation/onboarding_overlay.dart';
 import '../features/settings/presentation/settings_page.dart';
 import '../features/story_design/presentation/story_design_page.dart';
+import '../features/storyboard/application/storyboard_controller.dart';
 import '../features/storyboard/presentation/storyboard_page.dart';
 import '../features/updater/application/updater_controller.dart';
 import '../features/updater/domain/app_update_config.dart';
@@ -43,7 +44,10 @@ class _AppShellState extends ConsumerState<AppShell> {
   late int _tabIndex;
   late final UpdaterController _updaterController;
   late final OnboardingController _onboardingController;
+  late final StoryboardController _storyboardController;
   bool _updatePromptVisible = false;
+  bool _assetNormalizationPromptVisible = false;
+  bool _assetNormalizationDeferred = false;
 
   static const _tabs = <_ShellTab>[
     _ShellTab('设计分镜图', Icons.draw_rounded),
@@ -61,6 +65,8 @@ class _AppShellState extends ConsumerState<AppShell> {
     _onboardingController = OnboardingController(
       repository: OnboardingRepository(_globalDatabase()),
     )..addListener(_handleOnboardingChanged);
+    _storyboardController = ref.read(storyboardControllerProvider)
+      ..addListener(_handleAssetNormalizationStateChanged);
     _tabIndex =
         _loadSavedTabIndex() ??
         widget.initialTabIndex.clamp(0, _tabs.length - 1).toInt();
@@ -72,6 +78,7 @@ class _AppShellState extends ConsumerState<AppShell> {
         _onboardingController.start(originTabIndex: _tabIndex, automatic: true);
       }
       _updaterController.beginStartupFlow();
+      _handleAssetNormalizationStateChanged();
       _handleUpdaterStateChanged();
     });
   }
@@ -80,6 +87,7 @@ class _AppShellState extends ConsumerState<AppShell> {
   void dispose() {
     _onboardingController.removeListener(_handleOnboardingChanged);
     _onboardingController.dispose();
+    _storyboardController.removeListener(_handleAssetNormalizationStateChanged);
     _updaterController.removeListener(_handleUpdaterStateChanged);
     super.dispose();
   }
@@ -241,12 +249,33 @@ class _AppShellState extends ConsumerState<AppShell> {
       setState(() {});
     }
     if (!_onboardingController.visible) {
+      _handleAssetNormalizationStateChanged();
       _handleUpdaterStateChanged();
     }
   }
 
+  void _handleAssetNormalizationStateChanged() {
+    if (!mounted ||
+        _assetNormalizationPromptVisible ||
+        _assetNormalizationDeferred ||
+        _updatePromptVisible ||
+        _onboardingController.visible ||
+        !_storyboardController.value.assetNormalizationRequired) {
+      return;
+    }
+    _assetNormalizationPromptVisible = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_showAssetNormalizationDialog());
+    });
+  }
+
   void _handleUpdaterStateChanged() {
-    if (!mounted || _updatePromptVisible || _onboardingController.visible) {
+    if (!mounted ||
+        _updatePromptVisible ||
+        _assetNormalizationPromptVisible ||
+        (_storyboardController.value.assetNormalizationRequired &&
+            !_assetNormalizationDeferred) ||
+        _onboardingController.visible) {
       return;
     }
     if (!_updaterController.shouldShowReadyPrompt) {
@@ -309,7 +338,115 @@ class _AppShellState extends ConsumerState<AppShell> {
       }
     } finally {
       _updatePromptVisible = false;
-      if (mounted && _updaterController.shouldShowReadyPrompt) {
+      if (mounted) {
+        _handleAssetNormalizationStateChanged();
+        if (_updaterController.shouldShowReadyPrompt) {
+          _handleUpdaterStateChanged();
+        }
+      }
+    }
+  }
+
+  Future<void> _showAssetNormalizationDialog() async {
+    var normalizing = false;
+    try {
+      if (!mounted ||
+          _onboardingController.visible ||
+          !_storyboardController.value.assetNormalizationRequired) {
+        return;
+      }
+      final state = _storyboardController.value;
+      final result = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              return AlertDialog(
+                key: const ValueKey('legacy-asset-normalization-dialog'),
+                icon: const Icon(Icons.folder_copy_outlined),
+                title: const Text('归纳旧工程图片'),
+                content: SizedBox(
+                  width: 520,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '检测到旧工程中存在分散保存的图片。归纳后会同步更新 DATA 数据库和所有画板引用，图片仍可正常显示。',
+                      ),
+                      const SizedBox(height: 12),
+                      Text('AI 修改：${state.legacyAiEditedImageCount} 张'),
+                      Text('手动替换：${state.legacyManualReplacementImageCount} 张'),
+                      const SizedBox(height: 12),
+                      const Text(
+                        '图片将分别统一保存到“画板名称-AI修改”和“画板名称-手动替换”目录，并使用连续序号命名。',
+                      ),
+                      if (normalizing) ...[
+                        const SizedBox(height: 18),
+                        const Row(
+                          children: [
+                            SizedBox.square(
+                              dimension: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.4,
+                              ),
+                            ),
+                            SizedBox(width: 12),
+                            Expanded(child: Text('正在归纳并校验画板引用…')),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    key: const ValueKey('legacy-asset-normalization-later'),
+                    onPressed: normalizing
+                        ? null
+                        : () => Navigator.of(dialogContext).pop(false),
+                    child: const Text('稍后处理'),
+                  ),
+                  FilledButton.icon(
+                    key: const ValueKey('legacy-asset-normalization-now'),
+                    onPressed: normalizing
+                        ? null
+                        : () async {
+                            setDialogState(() => normalizing = true);
+                            final success = await _storyboardController
+                                .normalizeLegacyReplacementAssets();
+                            if (dialogContext.mounted) {
+                              Navigator.of(dialogContext).pop(success);
+                            }
+                          },
+                    icon: const Icon(Icons.auto_fix_high_rounded),
+                    label: const Text('立即归纳'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+      if (!mounted) {
+        return;
+      }
+      if (result == true) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('旧工程图片已归纳完成，画板引用已同步更新。')));
+      } else {
+        _assetNormalizationDeferred = true;
+        if (normalizing) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('图片归纳未完成，请重启应用后重试。')));
+        }
+      }
+    } finally {
+      _assetNormalizationPromptVisible = false;
+      if (mounted) {
         _handleUpdaterStateChanged();
       }
     }

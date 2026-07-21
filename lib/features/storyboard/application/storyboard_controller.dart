@@ -100,9 +100,16 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
   static const _workspaceSnapshotVersion = 3;
   static const _maxGridExtent = 12;
   static const _historyLimit = 100;
-  static const _aiEditedImagesDirectoryName = 'AI修改';
+  static const _aiEditedImagesDirectorySuffix = 'AI修改';
   static const _aiEditedImagesSourceName = 'AI修改';
   static const _aiEditedImagesImageId = 'storyboard-ai-edited-images';
+  static const _manualReplacementDirectorySuffix = '手动替换';
+  static const _manualReplacementSourceName = '手动替换';
+  static const _manualReplacementImageId =
+      'storyboard-manual-replacement-images';
+  static const _assetNormalizationVersionKey =
+      'storyboardAssetNormalizationVersion';
+  static const _assetNormalizationVersion = 1;
 
   final AppDatabase _database;
   final WorkspaceDirectories? _directories;
@@ -764,13 +771,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     required String? message,
     required bool evictImageCache,
   }) async {
-    var records = _database.listCutResults();
-    if (_directories != null) {
-      final migrated = await _migrateLegacyAiEditedImages(records);
-      if (migrated) {
-        records = _database.listCutResults();
-      }
-    }
+    final records = _database.listCutResults();
+    final normalization = _detectLegacyAssetNormalization(records);
     final scanRequest = _AssetScanRequest(
       cutResults: [
         for (final record in records)
@@ -791,18 +793,28 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     final deleted = _database.deleteCutResultsByIds(scanResult.missingIds);
     final refreshedRecords = _database.listCutResults();
     final aiEditedIndexByAssetId = _aiEditedIndexByAssetId(refreshedRecords);
+    final manualReplacementIndexByAssetId = _manualReplacementIndexByAssetId(
+      refreshedRecords,
+    );
     final assets = refreshedRecords
         .map(
           (record) => StoryboardCutAsset(
             id: record.id,
             imageId: _isAiEditedAssetId(record.id)
                 ? _aiEditedImagesImageId
+                : _isManualReplacementAssetId(record.id)
+                ? _manualReplacementImageId
                 : record.imageId,
             sourceName: _isAiEditedAssetId(record.id)
                 ? _aiEditedImagesSourceName
+                : _isManualReplacementAssetId(record.id)
+                ? _manualReplacementSourceName
                 : record.originalName,
             path: _toRuntimePath(record.path),
-            indexNo: aiEditedIndexByAssetId[record.id] ?? record.indexNo,
+            indexNo:
+                aiEditedIndexByAssetId[record.id] ??
+                manualReplacementIndexByAssetId[record.id] ??
+                record.indexNo,
           ),
         )
         .toList();
@@ -834,6 +846,9 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
         resourceGroups: resourceTree.groups,
         resourceRootOrder: resourceTree.rootOrder,
         boards: _reconcileBoardAssets(value.boards, assets, folders, validIds),
+        assetNormalizationRequired: normalization.total > 0,
+        legacyAiEditedImageCount: normalization.aiEdited,
+        legacyManualReplacementImageCount: normalization.manualReplacement,
         message:
             message ??
             _assetRefreshMessage(
@@ -869,6 +884,118 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     ];
   }
 
+  ({int aiEdited, int manualReplacement, int total})
+  _detectLegacyAssetNormalization(List<CutResultRecord> records) {
+    if (_database.getSetting(_assetNormalizationVersionKey) ==
+        '$_assetNormalizationVersion') {
+      return (aiEdited: 0, manualReplacement: 0, total: 0);
+    }
+    var aiEdited = 0;
+    var manualReplacement = 0;
+    for (final record in records) {
+      final file = File(_toRuntimePath(record.path));
+      if (!file.existsSync()) {
+        continue;
+      }
+      if (_isAiEditedAssetId(record.id) &&
+          (record.imageId != _aiEditedImagesImageId ||
+              !_isAiEditedImageArchived(file))) {
+        aiEdited++;
+      } else if (_isManualReplacementAssetId(record.id) &&
+          (record.imageId != _manualReplacementImageId ||
+              !_isManualReplacementImageArchived(file))) {
+        manualReplacement++;
+      }
+    }
+    return (
+      aiEdited: aiEdited,
+      manualReplacement: manualReplacement,
+      total: aiEdited + manualReplacement,
+    );
+  }
+
+  bool _isAiEditedImageArchived(File file) {
+    final directoryName = p.basename(file.parent.path);
+    return directoryName != _aiEditedImagesDirectorySuffix &&
+        directoryName.endsWith('-$_aiEditedImagesDirectorySuffix') &&
+        RegExp(r'^\d+-.+-AI修改\.[^.]+$').hasMatch(p.basename(file.path));
+  }
+
+  bool _isManualReplacementImageArchived(File file) {
+    return p
+            .basename(file.parent.path)
+            .endsWith('-$_manualReplacementDirectorySuffix') &&
+        RegExp(r'^\d+-.+-手动替换\.[^.]+$').hasMatch(p.basename(file.path));
+  }
+
+  Future<bool> normalizeLegacyReplacementAssets() async {
+    final directories = _directories;
+    if (directories == null || value.isNormalizingAssets) {
+      return false;
+    }
+    final initialRecords = _database.listCutResults();
+    final pending = _detectLegacyAssetNormalization(initialRecords);
+    if (pending.total == 0) {
+      _database.setSetting(
+        _assetNormalizationVersionKey,
+        '$_assetNormalizationVersion',
+      );
+      value = value.copyWith(
+        assetNormalizationRequired: false,
+        legacyAiEditedImageCount: 0,
+        legacyManualReplacementImageCount: 0,
+      );
+      return true;
+    }
+
+    value = value.copyWith(
+      isNormalizingAssets: true,
+      message: '正在归纳 AI 修改和手动替换图片，请勿关闭工程',
+    );
+    try {
+      var records = initialRecords;
+      await _migrateLegacyAiEditedImages(records);
+      records = _database.listCutResults();
+      await _migrateLegacyManualReplacementImages(records);
+      await _reloadAssets(
+        message:
+            '图片归纳完成：AI 修改 ${pending.aiEdited} 张，手动替换 ${pending.manualReplacement} 张',
+        evictImageCache: true,
+        ensureLatest: true,
+      );
+      _database.setSetting(
+        _assetNormalizationVersionKey,
+        '$_assetNormalizationVersion',
+      );
+      value = value.copyWith(
+        isNormalizingAssets: false,
+        assetNormalizationRequired: false,
+        legacyAiEditedImageCount: 0,
+        legacyManualReplacementImageCount: 0,
+        message:
+            '图片归纳完成：AI 修改 ${pending.aiEdited} 张，手动替换 ${pending.manualReplacement} 张',
+      );
+      flushWorkspaceSnapshot();
+      return true;
+    } catch (error) {
+      try {
+        await _reloadAssets(
+          message: '图片归纳未完成，可稍后重试：$error',
+          evictImageCache: true,
+          ensureLatest: true,
+        );
+      } catch (_) {
+        // 保留原始错误，避免刷新异常覆盖归纳失败原因。
+      }
+      value = value.copyWith(
+        isNormalizingAssets: false,
+        assetNormalizationRequired: true,
+        message: '图片归纳未完成，可稍后重试：$error',
+      );
+      return false;
+    }
+  }
+
   Future<bool> _migrateLegacyAiEditedImages(
     List<CutResultRecord> records,
   ) async {
@@ -876,7 +1003,6 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     if (directories == null) {
       return false;
     }
-    final outputDirectory = _aiEditedImagesDirectory(directories);
     final generatedRecords = records
         .where((record) => _isAiEditedAssetId(record.id))
         .toList();
@@ -897,77 +1023,311 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       return byTime != 0 ? byTime : first.id.compareTo(second.id);
     });
 
-    final archivedNamePattern = RegExp(r'^\d+-.+-AI修改\.[^.]+$');
-    var changed = false;
     var sequence = 0;
     for (final record in generatedRecords) {
       final source = File(_toRuntimePath(record.path));
       if (!source.existsSync()) {
         continue;
       }
-      final alreadyArchived =
-          _sameDirectory(source.parent, outputDirectory) &&
-          archivedNamePattern.hasMatch(p.basename(source.path));
-      if (alreadyArchived) {
+      if (_isAiEditedImageArchived(source)) {
         final parsed = int.tryParse(p.basename(source.path).split('-').first);
         sequence = math.max(sequence, parsed ?? record.indexNo);
+      }
+    }
+
+    var changed = false;
+    for (final record in generatedRecords) {
+      final source = File(_toRuntimePath(record.path));
+      if (!source.existsSync()) {
         continue;
       }
-
-      await outputDirectory.create(recursive: true);
-      sequence++;
-      final generation = generationByAssetId[record.id];
-      final boardName = value.boards
-          .cast<StoryboardBoard?>()
-          .firstWhere(
-            (board) => board?.id == generation?.boardId,
-            orElse: () => null,
-          )
-          ?.name;
-      final safeBoardName = _safeFileNamePart(
-        boardName ?? '历史画板',
-        fallback: '历史画板',
-      );
-      final extension = p.extension(source.path).toLowerCase();
-      final safeExtension = _isSupportedImage(source.path) ? extension : '.png';
-      var target = File(
-        p.join(
-          outputDirectory.path,
-          '${sequence.toString().padLeft(3, '0')}-$safeBoardName-AI修改$safeExtension',
-        ),
-      );
-      while (target.existsSync() && !_sameFilePath(source, target)) {
+      final alreadyArchived = _isAiEditedImageArchived(source);
+      var archivedFile = source;
+      var archivedIndex = record.indexNo;
+      if (!alreadyArchived) {
         sequence++;
-        target = File(
+        final boardName = _aiEditedImageBoardName(
+          record.id,
+          source,
+          generationByAssetId[record.id]?.boardId,
+        );
+        final safeBoardName = _safeFileNamePart(boardName, fallback: '历史画板');
+        final outputDirectory = _aiEditedImagesDirectory(
+          directories,
+          safeBoardName,
+        );
+        await outputDirectory.create(recursive: true);
+        final extension = p.extension(source.path).toLowerCase();
+        final safeExtension = _isSupportedImage(source.path)
+            ? extension
+            : '.png';
+        var target = File(
           p.join(
             outputDirectory.path,
             '${sequence.toString().padLeft(3, '0')}-$safeBoardName-AI修改$safeExtension',
           ),
         );
-      }
+        while (target.existsSync() && !_sameFilePath(source, target)) {
+          sequence++;
+          target = File(
+            p.join(
+              outputDirectory.path,
+              '${sequence.toString().padLeft(3, '0')}-$safeBoardName-AI修改$safeExtension',
+            ),
+          );
+        }
 
-      File moved;
-      try {
-        moved = await source.rename(target.path);
-      } on FileSystemException {
-        moved = await source.copy(target.path);
         try {
-          await source.delete();
+          archivedFile = await source.rename(target.path);
         } on FileSystemException {
-          // 复制成功即可完成兼容迁移，无法删除的旧文件留给用户手动处理。
+          archivedFile = await source.copy(target.path);
+          try {
+            await source.delete();
+          } on FileSystemException {
+            // 复制成功即可完成兼容迁移，无法删除的旧文件留给用户手动处理。
+          }
+        }
+        archivedIndex = sequence;
+        _database.updateCutResultPathAndIndex(
+          record.id,
+          _toStoredPath(archivedFile.path),
+          archivedIndex,
+        );
+        changed = true;
+      } else {
+        final parsed = int.tryParse(p.basename(source.path).split('-').first);
+        if (parsed != null && parsed != record.indexNo) {
+          archivedIndex = parsed;
+          _database.updateCutResultPathAndIndex(
+            record.id,
+            _toStoredPath(source.path),
+            archivedIndex,
+          );
+          changed = true;
         }
       }
-      final storedPath = _toStoredPath(moved.path);
-      _database
-        ..updateCutResultPathAndIndex(record.id, storedPath, sequence)
-        ..updateImportedImageStoredPath(record.imageId, storedPath)
-        ..updateImageGenerationResultPathByAssetId(record.id, storedPath);
-      changed = true;
+
+      final storedPath = _toStoredPath(archivedFile.path);
+      if (record.imageId != _aiEditedImagesImageId) {
+        final previousImageId = record.imageId;
+        _database
+          ..upsertImportedImage(
+            id: _aiEditedImagesImageId,
+            originalPath: storedPath,
+            originalName: _aiEditedImagesSourceName,
+            storedPath: storedPath,
+            width: record.width,
+            height: record.height,
+            createdAt: record.createdAt,
+          )
+          ..reassignCutResultImageSource(
+            resultId: record.id,
+            taskId: record.taskId,
+            imageId: _aiEditedImagesImageId,
+          )
+          ..deleteImportedImageIfUnreferenced(previousImageId);
+        changed = true;
+      } else if (!alreadyArchived) {
+        _database.updateImportedImageStoredPath(
+          _aiEditedImagesImageId,
+          storedPath,
+        );
+      }
+      if (!alreadyArchived) {
+        _database.updateImageGenerationResultPathByAssetId(
+          record.id,
+          storedPath,
+        );
+      }
     }
     if (changed) {
       const EmptyDirectoryCleaner().cleanChildren(directories.generatedImages);
     }
     return changed;
+  }
+
+  String _aiEditedImageBoardName(
+    String assetId,
+    File source,
+    String? generationBoardId,
+  ) {
+    if (generationBoardId != null) {
+      for (final board in value.boards) {
+        if (board.id == generationBoardId) {
+          return board.name;
+        }
+      }
+    }
+    for (final board in value.boards) {
+      if (board.items.any((item) => item.asset.id == assetId)) {
+        return board.name;
+      }
+    }
+    final legacyParentName = p.basename(source.parent.path);
+    for (final board in value.boards) {
+      if (board.id == legacyParentName) {
+        return board.name;
+      }
+    }
+    final archivedName = RegExp(
+      r'^\d+-(.+)-AI修改\.[^.]+$',
+    ).firstMatch(p.basename(source.path));
+    return archivedName?.group(1) ?? '历史画板';
+  }
+
+  Future<bool> _migrateLegacyManualReplacementImages(
+    List<CutResultRecord> records,
+  ) async {
+    final directories = _directories;
+    if (directories == null) {
+      return false;
+    }
+    final replacementRecords =
+        records
+            .where((record) => _isManualReplacementAssetId(record.id))
+            .toList()
+          ..sort((first, second) {
+            final byTime = first.createdAt.compareTo(second.createdAt);
+            return byTime != 0 ? byTime : first.id.compareTo(second.id);
+          });
+    if (replacementRecords.isEmpty) {
+      return false;
+    }
+
+    final archivedNamePattern = RegExp(r'^\d+-.+-手动替换\.[^.]+$');
+    var sequence = 0;
+    for (final record in replacementRecords) {
+      final source = File(_toRuntimePath(record.path));
+      if (!source.existsSync()) {
+        continue;
+      }
+      final archivedDirectory = p.basename(source.parent.path);
+      if (archivedDirectory.endsWith('-$_manualReplacementDirectorySuffix') &&
+          archivedNamePattern.hasMatch(p.basename(source.path))) {
+        final parsed = int.tryParse(p.basename(source.path).split('-').first);
+        sequence = math.max(sequence, parsed ?? record.indexNo);
+      }
+    }
+
+    var changed = false;
+    for (final record in replacementRecords) {
+      final source = File(_toRuntimePath(record.path));
+      if (!source.existsSync()) {
+        continue;
+      }
+      final archivedDirectory = p.basename(source.parent.path);
+      final alreadyArchived =
+          archivedDirectory.endsWith('-$_manualReplacementDirectorySuffix') &&
+          archivedNamePattern.hasMatch(p.basename(source.path));
+      var archivedFile = source;
+      var archivedIndex = record.indexNo;
+      if (!alreadyArchived) {
+        sequence++;
+        final boardName = _manualReplacementBoardName(record.id, source);
+        final safeBoardName = _safeFileNamePart(boardName, fallback: '历史画板');
+        final outputDirectory = _manualReplacementDirectory(
+          directories,
+          safeBoardName,
+        );
+        await outputDirectory.create(recursive: true);
+        final extension = p.extension(source.path).toLowerCase();
+        final safeExtension = _isSupportedImage(source.path)
+            ? extension
+            : '.png';
+        var target = File(
+          p.join(
+            outputDirectory.path,
+            '${sequence.toString().padLeft(3, '0')}-$safeBoardName-手动替换$safeExtension',
+          ),
+        );
+        while (target.existsSync() && !_sameFilePath(source, target)) {
+          sequence++;
+          target = File(
+            p.join(
+              outputDirectory.path,
+              '${sequence.toString().padLeft(3, '0')}-$safeBoardName-手动替换$safeExtension',
+            ),
+          );
+        }
+
+        try {
+          archivedFile = await source.rename(target.path);
+        } on FileSystemException {
+          archivedFile = await source.copy(target.path);
+          try {
+            await source.delete();
+          } on FileSystemException {
+            // 复制成功即可完成兼容迁移，无法删除的旧文件留给用户手动处理。
+          }
+        }
+        archivedIndex = sequence;
+        _database.updateCutResultPathAndIndex(
+          record.id,
+          _toStoredPath(archivedFile.path),
+          archivedIndex,
+        );
+        changed = true;
+      } else {
+        final parsed = int.tryParse(p.basename(source.path).split('-').first);
+        if (parsed != null && parsed != record.indexNo) {
+          archivedIndex = parsed;
+          _database.updateCutResultPathAndIndex(
+            record.id,
+            _toStoredPath(source.path),
+            archivedIndex,
+          );
+          changed = true;
+        }
+      }
+
+      final storedPath = _toStoredPath(archivedFile.path);
+      if (record.imageId != _manualReplacementImageId) {
+        final previousImageId = record.imageId;
+        _database
+          ..upsertImportedImage(
+            id: _manualReplacementImageId,
+            originalPath: storedPath,
+            originalName: _manualReplacementSourceName,
+            storedPath: storedPath,
+            width: record.width,
+            height: record.height,
+            createdAt: record.createdAt,
+          )
+          ..reassignCutResultImageSource(
+            resultId: record.id,
+            taskId: record.taskId,
+            imageId: _manualReplacementImageId,
+          )
+          ..deleteImportedImageIfUnreferenced(previousImageId);
+        changed = true;
+      } else if (!alreadyArchived) {
+        _database.updateImportedImageStoredPath(
+          _manualReplacementImageId,
+          storedPath,
+        );
+      }
+    }
+    if (changed) {
+      const EmptyDirectoryCleaner().cleanChildren(directories.generatedImages);
+    }
+    return changed;
+  }
+
+  String _manualReplacementBoardName(String assetId, File source) {
+    for (final board in value.boards) {
+      if (board.items.any((item) => item.asset.id == assetId)) {
+        return board.name;
+      }
+    }
+    if (p.basename(source.parent.path) == 'manual_replacements') {
+      final legacyBoardId = p.basename(source.parent.parent.path);
+      for (final board in value.boards) {
+        if (board.id == legacyBoardId) {
+          return board.name;
+        }
+      }
+    }
+    return '历史画板';
   }
 
   Map<String, int> _aiEditedIndexByAssetId(List<CutResultRecord> records) {
@@ -990,13 +1350,29 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
   bool _isAiEditedAssetId(String assetId) =>
       assetId.startsWith('generated-cut-');
 
-  bool _sameDirectory(Directory first, Directory second) {
-    final firstPath = p.normalize(first.absolute.path);
-    final secondPath = p.normalize(second.absolute.path);
-    return Platform.isWindows
-        ? firstPath.toLowerCase() == secondPath.toLowerCase()
-        : firstPath == secondPath;
+  Map<String, int> _manualReplacementIndexByAssetId(
+    List<CutResultRecord> records,
+  ) {
+    final replacements =
+        records
+            .where((record) => _isManualReplacementAssetId(record.id))
+            .toList()
+          ..sort((first, second) {
+            final byIndex = first.indexNo.compareTo(second.indexNo);
+            if (byIndex != 0) {
+              return byIndex;
+            }
+            final byTime = first.createdAt.compareTo(second.createdAt);
+            return byTime != 0 ? byTime : first.id.compareTo(second.id);
+          });
+    return {
+      for (var index = 0; index < replacements.length; index++)
+        replacements[index].id: index + 1,
+    };
   }
+
+  bool _isManualReplacementAssetId(String assetId) =>
+      assetId.startsWith('replacement-cut-');
 
   void _evictFileImageCache(Iterable<String> paths) {
     for (final path in paths) {
@@ -1028,7 +1404,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       }
     }
 
-    if (imageId == _aiEditedImagesImageId) {
+    if (imageId == _aiEditedImagesImageId ||
+        imageId == _manualReplacementImageId) {
       _database.deleteCutResultsByIds(assets.map((asset) => asset.id));
     } else {
       _database.deleteCutResultsForImage(imageId);
@@ -1564,23 +1941,19 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     }
 
     try {
-      final outputDirectory = Directory(
-        p.join(
-          directories.generatedImages.path,
-          board.id,
-          'manual_replacements',
-        ),
+      final archivedReplacement = await _archiveManualReplacementImage(
+        sourcePath: source.path,
+        boardName: board.name,
       );
-      await outputDirectory.create(recursive: true);
-      final target = _uniqueFile(outputDirectory, p.basename(source.path));
-      final copied = await source.copy(target.path);
       final replacement = _registerReplacementImageAsset(
         originalPath: source.path,
-        resultPath: copied.path,
-        sourceName: '手动替换_${p.basename(source.path)}',
+        resultPath: archivedReplacement.path,
+        sourceName: _manualReplacementSourceName,
         size: size,
         idPrefix: 'replacement',
         taskStatus: 'manual-replacement',
+        sharedImageId: _manualReplacementImageId,
+        indexNo: archivedReplacement.indexNo,
       );
       return _replaceCurrentItemAsset(
         boardId: board.id,
@@ -2058,7 +2431,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
           imageSize: imageSize,
           quality: quality,
           referenceImagePaths: references,
-          outputDirectory: _aiEditedImagesDirectory(directories),
+          outputDirectory: _aiEditedImagesDirectory(directories, board.name),
         ),
       );
       final archivedResult = await _archiveAiEditedImage(
@@ -3173,10 +3546,83 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     );
   }
 
-  Directory _aiEditedImagesDirectory(WorkspaceDirectories directories) {
+  Directory _aiEditedImagesDirectory(
+    WorkspaceDirectories directories,
+    String boardName,
+  ) {
+    final safeBoardName = _safeFileNamePart(boardName, fallback: '画板');
     return Directory(
-      p.join(directories.generatedImages.path, _aiEditedImagesDirectoryName),
+      p.join(
+        directories.generatedImages.path,
+        '$safeBoardName-$_aiEditedImagesDirectorySuffix',
+      ),
     );
+  }
+
+  Directory _manualReplacementDirectory(
+    WorkspaceDirectories directories,
+    String boardName,
+  ) {
+    final safeBoardName = _safeFileNamePart(boardName, fallback: '画板');
+    return Directory(
+      p.join(
+        directories.generatedImages.path,
+        '$safeBoardName-$_manualReplacementDirectorySuffix',
+      ),
+    );
+  }
+
+  Future<({String path, int indexNo})> _archiveManualReplacementImage({
+    required String sourcePath,
+    required String boardName,
+  }) async {
+    final directories = _directories!;
+    final safeBoardName = _safeFileNamePart(boardName, fallback: '画板');
+    final outputDirectory = _manualReplacementDirectory(
+      directories,
+      safeBoardName,
+    );
+    await outputDirectory.create(recursive: true);
+    final indexNo = _nextManualReplacementIndex(directories);
+    final extension = p.extension(sourcePath).toLowerCase();
+    final safeExtension = _isSupportedImage(sourcePath) ? extension : '.png';
+    final fileName =
+        '${indexNo.toString().padLeft(3, '0')}-$safeBoardName-手动替换$safeExtension';
+    final copied = await File(
+      sourcePath,
+    ).copy(p.join(outputDirectory.path, fileName));
+    return (path: copied.path, indexNo: indexNo);
+  }
+
+  int _nextManualReplacementIndex(WorkspaceDirectories directories) {
+    var maxIndex = 0;
+    for (final record in _database.listCutResults()) {
+      if (!_isManualReplacementAssetId(record.id)) {
+        continue;
+      }
+      maxIndex = math.max(maxIndex, record.indexNo);
+    }
+    if (directories.generatedImages.existsSync()) {
+      final sequencePattern = RegExp(r'^(\d+)-');
+      final manualDirectories = directories.generatedImages
+          .listSync()
+          .whereType<Directory>()
+          .where(
+            (directory) => p
+                .basename(directory.path)
+                .endsWith('-$_manualReplacementDirectorySuffix'),
+          );
+      for (final directory in manualDirectories) {
+        for (final file in directory.listSync().whereType<File>()) {
+          final match = sequencePattern.firstMatch(p.basename(file.path));
+          final parsed = match == null ? null : int.tryParse(match.group(1)!);
+          if (parsed != null) {
+            maxIndex = math.max(maxIndex, parsed);
+          }
+        }
+      }
+    }
+    return maxIndex + 1;
   }
 
   Future<({String path, int indexNo})> _archiveAiEditedImage({
@@ -3184,12 +3630,15 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     required String boardName,
   }) async {
     final directories = _directories!;
-    final outputDirectory = _aiEditedImagesDirectory(directories);
+    final safeBoardName = _safeFileNamePart(boardName, fallback: '画板');
+    final outputDirectory = _aiEditedImagesDirectory(
+      directories,
+      safeBoardName,
+    );
     await outputDirectory.create(recursive: true);
-    final indexNo = _nextAiEditedImageIndex(outputDirectory);
+    final indexNo = _nextAiEditedImageIndex(directories);
     final extension = p.extension(sourcePath).toLowerCase();
     final safeExtension = _isSupportedImage(sourcePath) ? extension : '.png';
-    final safeBoardName = _safeFileNamePart(boardName, fallback: '画板');
     final fileName =
         '${indexNo.toString().padLeft(3, '0')}-$safeBoardName-AI修改$safeExtension';
     final target = File(p.join(outputDirectory.path, fileName));
@@ -3211,7 +3660,7 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     }
   }
 
-  int _nextAiEditedImageIndex(Directory outputDirectory) {
+  int _nextAiEditedImageIndex(WorkspaceDirectories directories) {
     var maxIndex = 0;
     for (final record in _database.listCutResults()) {
       if (!_isAiEditedAssetId(record.id)) {
@@ -3219,13 +3668,23 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       }
       maxIndex = math.max(maxIndex, record.indexNo);
     }
-    if (outputDirectory.existsSync()) {
+    if (directories.generatedImages.existsSync()) {
       final sequencePattern = RegExp(r'^(\d+)-');
-      for (final file in outputDirectory.listSync().whereType<File>()) {
-        final match = sequencePattern.firstMatch(p.basename(file.path));
-        final parsed = match == null ? null : int.tryParse(match.group(1)!);
-        if (parsed != null) {
-          maxIndex = math.max(maxIndex, parsed);
+      final aiEditedDirectories = directories.generatedImages
+          .listSync()
+          .whereType<Directory>()
+          .where(
+            (directory) => p
+                .basename(directory.path)
+                .endsWith('-$_aiEditedImagesDirectorySuffix'),
+          );
+      for (final directory in aiEditedDirectories) {
+        for (final file in directory.listSync().whereType<File>()) {
+          final match = sequencePattern.firstMatch(p.basename(file.path));
+          final parsed = match == null ? null : int.tryParse(match.group(1)!);
+          if (parsed != null) {
+            maxIndex = math.max(maxIndex, parsed);
+          }
         }
       }
     }
