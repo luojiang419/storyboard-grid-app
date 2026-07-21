@@ -1842,6 +1842,11 @@ void main() {
     );
     expect(p.basename(first.asset.path), isNot('fake_result.png'));
     expect(File(first.asset.path).existsSync(), isTrue);
+    expect(File('${first.asset.path}.json').existsSync(), isTrue);
+    expect(
+      File('${fixture.imageService.resultPath}.json').existsSync(),
+      isFalse,
+    );
     expect(first.caption, '保留当前说明');
     expect(first.flipHorizontal, isTrue);
     expect(second.asset.id, 'asset-2');
@@ -1861,6 +1866,62 @@ void main() {
       controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
       generatedAssetId,
     );
+  });
+
+  test('多个图片修改任务可并发生成且完成后不会切走当前画板', () async {
+    final fixture = await _createImageGenerationFixture(
+      imageServiceFactory: _ConcurrentImageGenerationService.new,
+    );
+    final imageService =
+        fixture.imageService as _ConcurrentImageGenerationService;
+    final controller = fixture.controller;
+    final assets = [
+      await _registeredAsset(fixture.database, fixture.root, 1),
+      await _registeredAsset(fixture.database, fixture.root, 2),
+    ];
+    controller.setAssetsUsed(assets, true);
+    final sourceBoard = controller.value.selectedBoard!;
+
+    final firstTask = controller.generateReplacementForItem(
+      item: sourceBoard.itemAtSlot(0)!,
+      prompt: '并发任务一',
+      model: 'nano-banana-fast',
+      aspectRatio: '16:9',
+      imageSize: '2K',
+      quality: 'auto',
+      extraReferenceImagePaths: const [],
+    );
+    final secondTask = controller.generateReplacementForItem(
+      item: sourceBoard.itemAtSlot(1)!,
+      prompt: '并发任务二',
+      model: 'nano-banana-fast',
+      aspectRatio: '16:9',
+      imageSize: '2K',
+      quality: 'auto',
+      extraReferenceImagePaths: const [],
+    );
+    await imageService.bothStarted.future;
+    expect(imageService.requests, hasLength(2));
+    expect(controller.value.isGeneratingImage, isTrue);
+
+    controller.addBoard();
+    final activeBoardId = controller.value.selectedBoardId;
+    imageService.releaseAll();
+    expect(await Future.wait([firstTask, secondTask]), [isTrue, isTrue]);
+
+    expect(controller.value.selectedBoardId, activeBoardId);
+    final updatedSourceBoard = controller.value.boards.firstWhere(
+      (board) => board.id == sourceBoard.id,
+    );
+    expect(
+      updatedSourceBoard.items.map((item) => item.asset.id),
+      everyElement(startsWith('generated-cut-')),
+    );
+    expect(updatedSourceBoard.items.map((item) => item.asset.indexNo).toSet(), {
+      1,
+      2,
+    });
+    expect(controller.value.isGeneratingImage, isFalse);
   });
 
   test('连续 AI 修改按画板名称归档并合并为单一来源组', () async {
@@ -1919,12 +1980,17 @@ void main() {
             .map((file) => p.basename(file.path))
             .toList()
           ..sort();
-    expect(names, ['001-春日_镜头-AI修改.png', '002-春日_镜头-AI修改.png']);
+    expect(names, [
+      '001-春日_镜头-AI修改.png',
+      '001-春日_镜头-AI修改.png.json',
+      '002-春日_镜头-AI修改.png',
+      '002-春日_镜头-AI修改.png.json',
+    ]);
     expect(
       Directory(
         p.join(fixture.directories.generatedImages.path, '夜景镜头-AI修改'),
       ).listSync().whereType<File>().map((file) => p.basename(file.path)),
-      ['003-夜景镜头-AI修改.png'],
+      ['003-夜景镜头-AI修改.png', '003-夜景镜头-AI修改.png.json'],
     );
     expect(
       fixture.directories.generatedImages.listSync().whereType<Directory>(),
@@ -2746,6 +2812,9 @@ class _FakeImageGenerationService extends ImageGenerationService {
     img.fill(image, color: img.ColorRgb8(80, 120, 160));
     final file = File(p.join(request.outputDirectory.path, 'fake_result.png'));
     await file.writeAsBytes(img.encodePng(image));
+    await File('${file.path}.json').writeAsString(
+      '{"status":"succeeded","payloadOmissions":{"imagePayloadCount":1}}',
+    );
     resultPath = file.path;
     return ImageGenerationResult(
       localPath: file.path,
@@ -2779,5 +2848,47 @@ class _BlockingImageGenerationService extends _FakeImageGenerationService {
     }
     await _blocker.future;
     return super.generateEditedImage(request);
+  }
+}
+
+class _ConcurrentImageGenerationService extends _FakeImageGenerationService {
+  _ConcurrentImageGenerationService(super.root);
+
+  final bothStarted = Completer<void>();
+  final requests = <ImageGenerationRequest>[];
+  final _blockers = <Completer<void>>[];
+
+  void releaseAll() {
+    for (final blocker in _blockers) {
+      if (!blocker.isCompleted) {
+        blocker.complete();
+      }
+    }
+  }
+
+  @override
+  Future<ImageGenerationResult> generateEditedImage(
+    ImageGenerationRequest request,
+  ) async {
+    final requestIndex = requests.length;
+    requests.add(request);
+    final blocker = Completer<void>();
+    _blockers.add(blocker);
+    if (requests.length == 2 && !bothStarted.isCompleted) {
+      bothStarted.complete();
+    }
+    await blocker.future;
+    await request.outputDirectory.create(recursive: true);
+    final image = img.Image(width: 16, height: 10);
+    img.fill(image, color: img.ColorRgb8(80 + requestIndex, 120, 160));
+    final file = File(
+      p.join(request.outputDirectory.path, 'concurrent-$requestIndex.png'),
+    );
+    await file.writeAsBytes(img.encodePng(image));
+    return ImageGenerationResult(
+      localPath: file.path,
+      remoteUrl: 'https://files.example/concurrent-$requestIndex.png',
+      rawResponse: '{"status":"succeeded"}',
+    );
   }
 }

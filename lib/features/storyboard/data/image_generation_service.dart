@@ -575,6 +575,7 @@ class ImageGenerationService {
       final urls = _resultUrls(responseData);
       if (status == 'succeeded' && urls.isNotEmpty) {
         final remoteUrl = urls.first;
+        final rawResponse = _compactRawResponse(responseData);
         final localPath = await _downloadImage(
           remoteUrl,
           request.outputDirectory,
@@ -583,12 +584,12 @@ class ImageGenerationService {
           localPath: localPath,
           remoteUrl: remoteUrl,
           request: request,
-          rawResponse: jsonEncode(responseData),
+          rawResponse: rawResponse,
         );
         return ImageGenerationResult(
           localPath: localPath,
           remoteUrl: remoteUrl,
-          rawResponse: jsonEncode(responseData),
+          rawResponse: rawResponse,
         );
       }
       if (status == 'failed') {
@@ -670,7 +671,7 @@ class ImageGenerationService {
       inlineImage.mimeType,
       request.outputDirectory,
     );
-    final rawResponse = jsonEncode(responseData);
+    final rawResponse = _compactRawResponse(responseData);
     await _writeMetadata(
       localPath: localPath,
       remoteUrl: '',
@@ -845,7 +846,7 @@ class ImageGenerationService {
           throw HttpException(_errorMessage(taskData, 'APIMart 任务完成但未返回图片'));
         }
         final remoteUrl = urls.first;
-        final rawResponse = jsonEncode(taskData);
+        final rawResponse = _compactRawResponse(taskData);
         final localPath = await _downloadImage(
           remoteUrl,
           request.outputDirectory,
@@ -1329,6 +1330,83 @@ class ImageGenerationService {
     );
   }
 
+  String _compactRawResponse(Map<String, dynamic> responseData) {
+    final omissions = _ImageResponseOmissions();
+    final compacted =
+        _compactResponseValue(responseData, omissions: omissions)
+            as Map<String, dynamic>;
+    if (omissions.hasEntries) {
+      compacted['payloadOmissions'] = omissions.toJson();
+    }
+    return jsonEncode(compacted);
+  }
+
+  Object? _compactResponseValue(
+    Object? value, {
+    required _ImageResponseOmissions omissions,
+    String parentKey = '',
+  }) {
+    if (value is List) {
+      return [
+        for (final item in value)
+          _compactResponseValue(
+            item,
+            omissions: omissions,
+            parentKey: parentKey,
+          ),
+      ];
+    }
+    if (value is! Map) {
+      return value;
+    }
+
+    final compacted = <String, dynamic>{};
+    for (final entry in value.entries) {
+      final key = entry.key.toString();
+      final normalizedKey = key.replaceAll('_', '').toLowerCase();
+      final entryValue = entry.value;
+      if (normalizedKey == 'thoughtsignature') {
+        omissions.addThoughtSignature(entryValue);
+        continue;
+      }
+      if (_isEncodedImagePayload(
+        key: normalizedKey,
+        parentKey: parentKey,
+        value: entryValue,
+      )) {
+        omissions.addImagePayload(entryValue);
+        continue;
+      }
+      compacted[key] = _compactResponseValue(
+        entryValue,
+        omissions: omissions,
+        parentKey: key,
+      );
+    }
+    return compacted;
+  }
+
+  bool _isEncodedImagePayload({
+    required String key,
+    required String parentKey,
+    required Object? value,
+  }) {
+    if (value is! String || value.isEmpty) {
+      return false;
+    }
+    if (key == 'b64json' ||
+        key == 'imagedata' ||
+        key == 'imagebase64' ||
+        key == 'base64image') {
+      return true;
+    }
+    final normalizedParent = parentKey.replaceAll('_', '').toLowerCase();
+    if (key == 'data' && normalizedParent == 'inlinedata') {
+      return true;
+    }
+    return value.startsWith('data:image/') && value.contains(';base64,');
+  }
+
   void _validateBaseRequest(ImageGenerationRequest request) {
     final descriptor = ImageGenerationModelCatalog.descriptorFor(request.model);
     if (descriptor == null) {
@@ -1459,6 +1537,40 @@ class ImageGenerationService {
     }
     return candidate;
   }
+}
+
+class _ImageResponseOmissions {
+  var imagePayloadCount = 0;
+  var imagePayloadCharacters = 0;
+  var thoughtSignatureCount = 0;
+  var thoughtSignatureCharacters = 0;
+
+  bool get hasEntries => imagePayloadCount > 0 || thoughtSignatureCount > 0;
+
+  void addImagePayload(Object? value) {
+    imagePayloadCount++;
+    if (value is String) {
+      imagePayloadCharacters += value.length;
+    }
+  }
+
+  void addThoughtSignature(Object? value) {
+    thoughtSignatureCount++;
+    if (value is String) {
+      thoughtSignatureCharacters += value.length;
+    }
+  }
+
+  Map<String, int> toJson() => {
+    if (imagePayloadCount > 0) ...{
+      'imagePayloadCount': imagePayloadCount,
+      'imagePayloadCharacters': imagePayloadCharacters,
+    },
+    if (thoughtSignatureCount > 0) ...{
+      'opaqueSignatureCount': thoughtSignatureCount,
+      'opaqueSignatureCharacters': thoughtSignatureCharacters,
+    },
+  };
 }
 
 class _GeminiInlineImage {

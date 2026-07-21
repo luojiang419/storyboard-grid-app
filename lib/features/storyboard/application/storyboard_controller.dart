@@ -136,6 +136,8 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
   final _redoHistoryByBoardId = <String, List<StoryboardBoard>>{};
   _QueuedVisionTask? _activeVisionTask;
   var _visionQueueRunning = false;
+  var _activeImageGenerationCount = 0;
+  Future<void> _imageResultCommitTail = Future<void>.value();
 
   @override
   void dispose() {
@@ -2345,6 +2347,31 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     }
   }
 
+  bool enqueueReplacementForItem({
+    required StoryboardItem item,
+    required String prompt,
+    required String model,
+    required String aspectRatio,
+    required String imageSize,
+    required String quality,
+    required List<String> extraReferenceImagePaths,
+  }) {
+    final task = _prepareImageReplacementTask(
+      item: item,
+      prompt: prompt,
+      model: model,
+      aspectRatio: aspectRatio,
+      imageSize: imageSize,
+      quality: quality,
+      extraReferenceImagePaths: extraReferenceImagePaths,
+    );
+    if (task == null) {
+      return false;
+    }
+    unawaited(_runImageReplacementTask(task));
+    return true;
+  }
+
   Future<bool> generateReplacementForItem({
     required StoryboardItem item,
     required String prompt,
@@ -2353,42 +2380,61 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     required String imageSize,
     required String quality,
     required List<String> extraReferenceImagePaths,
-  }) async {
-    if (value.isGeneratingImage) {
-      value = value.copyWith(message: '正在修改图片，请稍候');
-      return false;
-    }
+  }) {
+    final task = _prepareImageReplacementTask(
+      item: item,
+      prompt: prompt,
+      model: model,
+      aspectRatio: aspectRatio,
+      imageSize: imageSize,
+      quality: quality,
+      extraReferenceImagePaths: extraReferenceImagePaths,
+    );
+    return task == null
+        ? Future<bool>.value(false)
+        : _runImageReplacementTask(task);
+  }
+
+  _PreparedImageReplacementTask? _prepareImageReplacementTask({
+    required StoryboardItem item,
+    required String prompt,
+    required String model,
+    required String aspectRatio,
+    required String imageSize,
+    required String quality,
+    required List<String> extraReferenceImagePaths,
+  }) {
     final directories = _directories;
     if (directories == null) {
       value = value.copyWith(message: '数据目录尚未初始化，无法生成图片');
-      return false;
+      return null;
     }
     final settingsController = _settingsController;
     if (settingsController == null) {
       value = value.copyWith(message: '图片生成设置尚未初始化');
-      return false;
+      return null;
     }
     final board = value.selectedBoard;
     if (board == null) {
       value = value.copyWith(message: '请先创建故事板');
-      return false;
+      return null;
     }
     if (_guardLockedBoard(board, '修改图片')) {
-      return false;
+      return null;
     }
     final currentItem = board.itemAtSlot(item.slotIndex);
     if (currentItem == null || currentItem.asset.id != item.asset.id) {
       value = value.copyWith(message: '当前图片已变化，请重新选择后再修改');
-      return false;
+      return null;
     }
     final source = File(currentItem.asset.path);
     if (!source.existsSync()) {
       value = value.copyWith(message: '当前图片文件不存在，无法作为参考图');
-      return false;
+      return null;
     }
     if (prompt.trim().isEmpty) {
       value = value.copyWith(message: '请先输入修改提示词');
-      return false;
+      return null;
     }
 
     final references = [
@@ -2413,62 +2459,117 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       ]),
       status: 'running',
     );
+    _activeImageGenerationCount++;
+    value = value.copyWith(
+      isGeneratingImage: true,
+      message: _activeImageGenerationCount == 1
+          ? '已提交后台图片修改任务'
+          : '已提交后台图片修改任务（$_activeImageGenerationCount 个进行中）',
+    );
+    return _PreparedImageReplacementTask(
+      generationId: generationId,
+      boardId: board.id,
+      boardName: board.name,
+      slotIndex: currentItem.slotIndex,
+      sourceAsset: currentItem.asset,
+      model: model,
+      prompt: prompt,
+      aspectRatio: aspectRatio,
+      imageSize: imageSize,
+      quality: quality,
+      referenceImagePaths: references,
+    );
+  }
 
-    value = value.copyWith(isGeneratingImage: true, message: '正在修改当前图片...');
-
+  Future<bool> _runImageReplacementTask(
+    _PreparedImageReplacementTask task,
+  ) async {
     try {
-      final settings = settingsController.value;
+      final settings = _settingsController!.value;
       final provider = ImageGenerationProviderResolver.resolve(
         settings: settings,
-        model: model,
+        model: task.model,
       );
       final result = await _imageGenerationService.generateEditedImage(
         ImageGenerationRequest(
           provider: provider,
-          model: model,
-          prompt: prompt,
-          aspectRatio: aspectRatio,
-          imageSize: imageSize,
-          quality: quality,
-          referenceImagePaths: references,
-          outputDirectory: _aiEditedImagesDirectory(directories, board.name),
+          model: task.model,
+          prompt: task.prompt,
+          aspectRatio: task.aspectRatio,
+          imageSize: task.imageSize,
+          quality: task.quality,
+          referenceImagePaths: task.referenceImagePaths,
+          outputDirectory: _aiEditedImagesDirectory(
+            _directories!,
+            task.boardName,
+          ),
         ),
       );
-      final archivedResult = await _archiveAiEditedImage(
-        sourcePath: result.localPath,
-        boardName: board.name,
-      );
-      final replacement = await _registerGeneratedImageAsset(
-        sourceAsset: currentItem.asset,
-        resultPath: archivedResult.path,
-        indexNo: archivedResult.indexNo,
-      );
-      final applied = _replaceCurrentItemAsset(
-        boardId: board.id,
-        slotIndex: currentItem.slotIndex,
-        oldAssetId: currentItem.asset.id,
-        replacement: replacement,
-      );
-      _database.updateImageGenerationRecord(
-        id: generationId,
-        status: applied ? 'succeeded' : 'orphaned',
-        resultAssetId: replacement.id,
-        resultPath: _toStoredPath(replacement.path),
-        rawResponse: result.rawResponse,
-      );
-      return applied;
+      return _withImageResultCommitLock(() async {
+        final archivedResult = await _archiveAiEditedImage(
+          sourcePath: result.localPath,
+          boardName: task.boardName,
+        );
+        final replacement = await _registerGeneratedImageAsset(
+          sourceAsset: task.sourceAsset,
+          resultPath: archivedResult.path,
+          indexNo: archivedResult.indexNo,
+        );
+        final applied = _replaceCurrentItemAsset(
+          boardId: task.boardId,
+          slotIndex: task.slotIndex,
+          oldAssetId: task.sourceAsset.id,
+          replacement: replacement,
+        );
+        _database.updateImageGenerationRecord(
+          id: task.generationId,
+          status: applied ? 'succeeded' : 'orphaned',
+          resultAssetId: replacement.id,
+          resultPath: _toStoredPath(replacement.path),
+          rawResponse: result.rawResponse,
+        );
+        return applied;
+      });
     } catch (error) {
       _database.updateImageGenerationRecord(
-        id: generationId,
+        id: task.generationId,
         status: 'failed',
         errorMessage: error.toString(),
       );
-      value = value.copyWith(
-        isGeneratingImage: false,
-        message: '图片修改失败：$error',
-      );
+      if (!_disposed) {
+        value = value.copyWith(message: '图片修改失败：$error');
+      }
       return false;
+    } finally {
+      _finishImageGenerationTask();
     }
+  }
+
+  Future<T> _withImageResultCommitLock<T>(Future<T> Function() action) async {
+    final previous = _imageResultCommitTail;
+    final release = Completer<void>();
+    _imageResultCommitTail = release.future;
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release.complete();
+    }
+  }
+
+  void _finishImageGenerationTask() {
+    _activeImageGenerationCount = math.max(0, _activeImageGenerationCount - 1);
+    if (_disposed) {
+      return;
+    }
+    final remaining = _activeImageGenerationCount;
+    final currentMessage = value.message.trim();
+    value = value.copyWith(
+      isGeneratingImage: remaining > 0,
+      message: remaining > 0 && currentMessage.isNotEmpty
+          ? '$currentMessage（另有 $remaining 个后台任务进行中）'
+          : currentMessage,
+    );
   }
 
   Future<void> analyzeSelectedBoardWithVision() async {
@@ -3648,6 +3749,10 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
     }
     try {
       final moved = await source.rename(target.path);
+      await _archiveImageMetadata(
+        sourcePath: source.path,
+        targetPath: moved.path,
+      );
       return (path: moved.path, indexNo: indexNo);
     } on FileSystemException {
       final copied = await source.copy(target.path);
@@ -3656,7 +3761,41 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       } on FileSystemException {
         // 复制已成功时保留无法删除的源文件，不影响结果可用性。
       }
+      await _archiveImageMetadata(
+        sourcePath: source.path,
+        targetPath: copied.path,
+      );
       return (path: copied.path, indexNo: indexNo);
+    }
+  }
+
+  Future<void> _archiveImageMetadata({
+    required String sourcePath,
+    required String targetPath,
+  }) async {
+    final source = File('$sourcePath.json');
+    if (!source.existsSync()) {
+      return;
+    }
+    final target = File('$targetPath.json');
+    if (_sameFilePath(source, target)) {
+      return;
+    }
+    try {
+      await source.rename(target.path);
+      return;
+    } on FileSystemException {
+      try {
+        await source.copy(target.path);
+      } on FileSystemException {
+        // 元数据归档失败不应使已成功生成的图片失效。
+        return;
+      }
+    }
+    try {
+      await source.delete();
+    } on FileSystemException {
+      // 复制已成功时保留无法删除的源元数据，不影响图片结果可用性。
     }
   }
 
@@ -3730,24 +3869,18 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
       }
     }
     if (currentBoard == null) {
-      value = value.copyWith(
-        isGeneratingImage: false,
-        message: '图片已生成，但当前画板已不存在',
-      );
+      value = value.copyWith(message: '图片已生成，但当前画板已不存在');
       return false;
     }
     if (currentBoard.locked) {
-      value = value.copyWith(
-        isGeneratingImage: false,
-        message: '${currentBoard.name} 已锁定，未自动替换',
-      );
+      value = value.copyWith(message: '${currentBoard.name} 已锁定，未自动替换');
       return false;
     }
     final itemIndex = currentBoard.items.indexWhere(
       (item) => item.slotIndex == slotIndex && item.asset.id == oldAssetId,
     );
     if (itemIndex < 0) {
-      value = value.copyWith(isGeneratingImage: false, message: changedMessage);
+      value = value.copyWith(message: changedMessage);
       return false;
     }
 
@@ -3768,8 +3901,6 @@ class StoryboardController extends ValueNotifier<StoryboardState> {
           for (final board in value.boards)
             if (board.id == boardId) nextBoard else board,
         ],
-        selectedBoardId: boardId,
-        isGeneratingImage: false,
         message: successMessage,
       ),
     );
@@ -5481,6 +5612,34 @@ List<int> _readImageSizeInWorker(TransferableTypedData transferable) {
   } catch (_) {
     return const [0, 0];
   }
+}
+
+class _PreparedImageReplacementTask {
+  const _PreparedImageReplacementTask({
+    required this.generationId,
+    required this.boardId,
+    required this.boardName,
+    required this.slotIndex,
+    required this.sourceAsset,
+    required this.model,
+    required this.prompt,
+    required this.aspectRatio,
+    required this.imageSize,
+    required this.quality,
+    required this.referenceImagePaths,
+  });
+
+  final String generationId;
+  final String boardId;
+  final String boardName;
+  final int slotIndex;
+  final StoryboardCutAsset sourceAsset;
+  final String model;
+  final String prompt;
+  final String aspectRatio;
+  final String imageSize;
+  final String quality;
+  final List<String> referenceImagePaths;
 }
 
 class _AnalyzedStoryboardItem {

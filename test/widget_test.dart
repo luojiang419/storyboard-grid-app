@@ -531,6 +531,125 @@ void main() {
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
+  testWidgets('裁切资源正倒序与文件夹置顶会持久化且置顶不受排序影响', (tester) async {
+    late final Directory root;
+    late final AppDirectories directories;
+    late final AppDatabase database;
+    late final StoryboardController controller;
+    late final StoryboardFolder firstFolder;
+    late final StoryboardFolder secondFolder;
+    late final StoryboardFolder thirdFolder;
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp('resource_order_widget_');
+      directories = await AppDirectories.create(executableDirectory: root);
+      database = await AppDatabase.open(directories.databaseFile);
+      controller = StoryboardController(
+        database: database,
+        directories: directories,
+      );
+      await controller.createFolder('顺序一');
+      await controller.createFolder('顺序二');
+      await controller.createFolder('顺序三');
+      firstFolder = controller.value.folders.firstWhere(
+        (folder) => folder.name == '顺序一',
+      );
+      secondFolder = controller.value.folders.firstWhere(
+        (folder) => folder.name == '顺序二',
+      );
+      thirdFolder = controller.value.folders.firstWhere(
+        (folder) => folder.name == '顺序三',
+      );
+    });
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    Widget buildPage() {
+      return ProviderScope(
+        overrides: [
+          appDatabaseProvider.overrideWithValue(database),
+          storyboardControllerProvider.overrideWithValue(controller),
+        ],
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      );
+    }
+
+    Finder folderNode(StoryboardFolder folder) => find.byKey(
+      ValueKey(
+        'resource-node-draggable-${StoryboardResourceNodeRef.folder(folder.id).key}',
+      ),
+    );
+
+    await tester.pumpWidget(buildPage());
+    await tester.pumpAndSettle();
+    expect(
+      tester.getTopLeft(folderNode(firstFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(secondFolder)).dy),
+    );
+    expect(
+      tester.getTopLeft(folderNode(secondFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(thirdFolder)).dy),
+    );
+
+    await tester.tap(
+      find.byKey(
+        ValueKey(
+          'resource-pin-${StoryboardResourceNodeRef.folder(secondFolder.id).key}',
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester.getTopLeft(folderNode(secondFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(firstFolder)).dy),
+    );
+
+    await tester.tap(
+      find.byKey(const ValueKey('resource-display-order-toggle')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('倒序'), findsOneWidget);
+    expect(
+      tester.getTopLeft(folderNode(secondFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(thirdFolder)).dy),
+    );
+    expect(
+      tester.getTopLeft(folderNode(thirdFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(firstFolder)).dy),
+    );
+
+    final saved =
+        jsonDecode(database.getSetting('storyboardAssetSidebarUiState')!)
+            as Map<String, dynamic>;
+    expect(saved['assetOrderAscending'], isFalse);
+    expect(
+      saved['pinnedResourceNodeKeys'],
+      contains(StoryboardResourceNodeRef.folder(secondFolder.id).key),
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await tester.pumpWidget(buildPage());
+    await tester.pumpAndSettle();
+    expect(find.text('倒序'), findsOneWidget);
+    expect(
+      tester.getTopLeft(folderNode(secondFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(thirdFolder)).dy),
+    );
+    expect(
+      tester.getTopLeft(folderNode(thirdFolder)).dy,
+      lessThan(tester.getTopLeft(folderNode(firstFolder)).dy),
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('故事板拼图页面浅色模式画布使用浅色动态背景', (tester) async {
     late final Directory root;
     late final AppDatabase database;
@@ -1204,6 +1323,7 @@ void main() {
 
     expect(find.byTooltip('修改图片'), findsOneWidget);
     expect(find.byTooltip('替换图片'), findsOneWidget);
+    expect(find.byTooltip('打开图片路径'), findsOneWidget);
 
     await tester.tap(find.byTooltip('修改图片'));
     await tester.pumpAndSettle();
@@ -1259,6 +1379,113 @@ void main() {
       ..clear()
       ..clearLiveImages();
     await tester.pump(const Duration(milliseconds: 50));
+  });
+
+  testWidgets('悬浮菜单可展开左栏并滚动定位到懒加载素材后突出显示', (tester) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    late final Directory root;
+    late final AppDatabase database;
+    late final StoryboardController controller;
+    const imageId = 'locate-source-image';
+    const targetAssetId = 'locate-asset-24';
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp('storyboard_locate_asset_');
+      database = await AppDatabase.open(
+        File('${root.path}${Platform.pathSeparator}storyboard.sqlite'),
+      );
+      final now = DateTime.now().toIso8601String();
+      database
+        ..upsertImportedImage(
+          id: imageId,
+          originalPath: '${root.path}${Platform.pathSeparator}source.png',
+          originalName: '深层素材',
+          storedPath: '${root.path}${Platform.pathSeparator}source.png',
+          width: 100,
+          height: 100,
+          createdAt: now,
+        )
+        ..upsertCutTask(
+          id: 'locate-source-task',
+          imageId: imageId,
+          status: 'exported',
+          rows: 4,
+          columns: 6,
+          confidence: 1,
+        );
+      for (var index = 1; index <= 24; index++) {
+        final file = File(
+          '${root.path}${Platform.pathSeparator}locate-$index.png',
+        );
+        await file.writeAsBytes(base64Decode(_onePixelPng));
+        database.insertCutResult(
+          id: 'locate-asset-$index',
+          taskId: 'locate-source-task',
+          imageId: imageId,
+          indexNo: index,
+          path: file.path,
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 1,
+          selected: true,
+        );
+      }
+      controller = StoryboardController(database: database);
+      await controller.refreshAssets();
+      controller.addOrRemoveAsset(
+        controller.value.assets.firstWhere(
+          (asset) => asset.id == targetAssetId,
+        ),
+      );
+    });
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appDatabaseProvider.overrideWithValue(database),
+          storyboardControllerProvider.overrideWithValue(controller),
+        ],
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(const ValueKey('asset-thumb-$targetAssetId')),
+      findsNothing,
+    );
+
+    await tester.tap(
+      find.byKey(const ValueKey('storyboard-image-$targetAssetId')),
+    );
+    await tester.pump();
+    await tester.tap(find.byTooltip('打开图片路径'));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('asset-located-$targetAssetId')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey('asset-thumb-$targetAssetId')).hitTestable(),
+      findsOneWidget,
+    );
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    PaintingBinding.instance.imageCache
+      ..clear()
+      ..clearLiveImages();
   });
 
   testWidgets('替换图片从右键菜单取消使用后可撤回恢复', (tester) async {
@@ -1371,7 +1598,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
   });
 
-  testWidgets('图片生成弹窗最小化后不取消后台任务', (tester) async {
+  testWidgets('点击生成会自动最小化并保留后台任务与面板参数', (tester) async {
     late final Directory root;
     late final AppDirectories directories;
     late final AppDatabase database;
@@ -1421,6 +1648,7 @@ void main() {
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
+          appDatabaseProvider.overrideWithValue(database),
           storyboardControllerProvider.overrideWithValue(controller),
           settingsControllerProvider.overrideWithValue(settingsController),
         ],
@@ -1442,14 +1670,17 @@ void main() {
     );
     await tester.enterText(promptField, '将背景改为沙滩');
     await tester.tap(find.text('生成'));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(imageService.started, isTrue);
-    expect(find.text('最小化'), findsOneWidget);
-    await tester.tap(find.text('最小化'));
-    await tester.pumpAndSettle();
     expect(find.text('修改图片'), findsNothing);
     expect(controller.value.isGeneratingImage, isTrue);
+    final savedPreferences =
+        jsonDecode(database.getSetting('storyboardImageEditPreferences')!)
+            as Map<String, dynamic>;
+    expect(savedPreferences['model'], 'nano-banana-fast');
+    expect(savedPreferences['aspectRatio'], 'auto');
+    expect(savedPreferences['imageSize'], '1K');
 
     await tester.pumpWidget(const SizedBox.shrink());
   });

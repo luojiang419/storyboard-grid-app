@@ -15,7 +15,7 @@ permissions:
 
 env:
   RELEASE_REPO: luojiang419/storyboard-grid-app-releases
-  MINIMUM_VERSION: v1.0.0.95
+  MINIMUM_VERSION: v1.0.0.97
 
 jobs:
   release:

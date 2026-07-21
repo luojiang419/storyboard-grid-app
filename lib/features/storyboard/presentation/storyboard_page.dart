@@ -24,6 +24,7 @@ import '../../settings/domain/app_settings.dart';
 import '../../settings/presentation/cut_image_number_controls.dart';
 import '../application/storyboard_controller.dart';
 import '../data/image_generation_service.dart';
+import '../data/storyboard_image_edit_preferences_repository.dart';
 import '../domain/storyboard_canvas_style.dart';
 import '../domain/storyboard_models.dart';
 import 'widgets/board_manager_dialog.dart';
@@ -143,6 +144,7 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
   double _assetSidebarWidth = 260;
   bool _assetSidebarExpanded = true;
   bool _inspectorExpanded = false;
+  final _assetSidebarKey = GlobalKey<_AssetSidebarState>();
   final _expandedInspectorSections = <_StoryboardInspectorSection>{};
 
   @override
@@ -195,6 +197,7 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
                               selector: _storyboardState,
                               equals: _sameAssetSidebarState,
                               builder: (context, state, _) => _AssetSidebar(
+                                key: _assetSidebarKey,
                                 state: state,
                                 onRefresh: controller.refreshAssets,
                                 onToggleAsset: controller.addOrRemoveAsset,
@@ -282,6 +285,8 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
                               onFlipVertical: controller.toggleItemFlipVertical,
                               onEditImage: (item) =>
                                   _showImageEditDialog(controller, item),
+                              onLocateAsset: (item) =>
+                                  unawaited(_locateAssetInSidebar(item.asset)),
                               onPickReplacementImage: (item) => unawaited(
                                 _pickReplacementImage(controller, item),
                               ),
@@ -356,6 +361,29 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
     StoryboardItem item,
   ) async {
     final settings = ref.read(settingsControllerProvider).value;
+    StoryboardImageEditPreferencesRepository? preferencesRepository;
+    var preferences = StoryboardImageEditPreferences(
+      model: settings.imageGenerationModel,
+      aspectRatio: 'auto',
+      imageSize: '1K',
+    );
+    try {
+      preferencesRepository = StoryboardImageEditPreferencesRepository(
+        ref.read(appDatabaseProvider),
+      );
+      preferences = preferencesRepository.load(
+        fallbackModel: settings.imageGenerationModel,
+      );
+      if (!ImageGenerationModelCatalog.values.contains(preferences.model)) {
+        preferences = StoryboardImageEditPreferences(
+          model: settings.imageGenerationModel,
+          aspectRatio: preferences.aspectRatio,
+          imageSize: preferences.imageSize,
+        );
+      }
+    } catch (_) {
+      // 组件测试或预览环境可能没有注入数据库，生产环境会正常持久化。
+    }
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -363,10 +391,35 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
         return _ImageEditDialog(
           controller: controller,
           item: item,
-          initialModel: settings.imageGenerationModel,
+          initialModel: preferences.model,
+          initialAspectRatio: preferences.aspectRatio,
+          initialImageSize: preferences.imageSize,
+          onPreferencesChanged: preferencesRepository?.save,
         );
       },
     );
+  }
+
+  Future<void> _locateAssetInSidebar(StoryboardCutAsset asset) async {
+    if (!_assetSidebarExpanded) {
+      _setAssetSidebarExpanded(true);
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    var located = false;
+    for (var attempt = 0; attempt < 3 && !located; attempt++) {
+      final sidebar = _assetSidebarKey.currentState;
+      if (sidebar != null) {
+        located = await sidebar.locateAsset(asset);
+        break;
+      }
+      await WidgetsBinding.instance.endOfFrame;
+    }
+    if (!mounted || located) {
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('左侧栏中未找到该图片资源')));
   }
 
   Future<void> _pickReplacementImage(
@@ -746,6 +799,7 @@ class _CollapsedInspectorRail extends StatelessWidget {
 
 class _AssetSidebar extends ConsumerStatefulWidget {
   const _AssetSidebar({
+    super.key,
     required this.state,
     required this.onRefresh,
     required this.onToggleAsset,
@@ -807,8 +861,11 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
 
   final _expandedSources = <String>{};
   final _expandedFolders = <String>{};
+  final _pinnedResourceNodeKeys = <String>[];
+  final _locatedAssetGridKey = GlobalKey();
   double _thumbSize = 70;
   bool _showThumbSizeSlider = false;
+  bool _assetOrderAscending = true;
   String? _rangeAnchorAssetId;
   String? _rangeTargetAssetId;
   bool _shiftPressed = false;
@@ -816,6 +873,8 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
   bool _groupModeEnabled = false;
   final _groupSourceImageIds = <String>{};
   final _groupFolderIds = <String>{};
+  String? _locatedAssetId;
+  int _locatedAssetIndex = 0;
 
   @override
   void initState() {
@@ -841,6 +900,17 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
         .toSet();
     _groupSourceImageIds.removeWhere((id) => !validSourceImageIds.contains(id));
     _groupFolderIds.removeWhere((id) => !validFolderIds.contains(id));
+    final validNodeKeys = <String>{
+      for (final group in widget.state.resourceGroups)
+        StoryboardResourceNodeRef.group(group.id).key,
+      for (final folder in widget.state.folders)
+        StoryboardResourceNodeRef.folder(folder.id).key,
+      for (final sourceImageId in validSourceImageIds)
+        StoryboardResourceNodeRef.source(sourceImageId).key,
+    };
+    _pinnedResourceNodeKeys.removeWhere(
+      (nodeKey) => !validNodeKeys.contains(nodeKey),
+    );
   }
 
   void _restoreUiState() {
@@ -864,6 +934,10 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
         70,
       ).clamp(_minThumbSize, _maxThumbSize).toDouble();
       _showThumbSizeSlider = _jsonBool(decoded['showThumbSizeSlider'], false);
+      _assetOrderAscending = _jsonBool(decoded['assetOrderAscending'], true);
+      _pinnedResourceNodeKeys
+        ..clear()
+        ..addAll(_jsonStringList(decoded['pinnedResourceNodeKeys']));
     } catch (_) {
       return;
     }
@@ -880,6 +954,8 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
               'expandedFolders': _expandedFolders.toList()..sort(),
               'thumbSize': _thumbSize,
               'showThumbSizeSlider': _showThumbSizeSlider,
+              'assetOrderAscending': _assetOrderAscending,
+              'pinnedResourceNodeKeys': _pinnedResourceNodeKeys,
             }),
           );
     } catch (_) {
@@ -892,6 +968,21 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
       return const <String>{};
     }
     return {for (final item in value) item?.toString() ?? ''}..remove('');
+  }
+
+  List<String> _jsonStringList(Object? value) {
+    if (value is! List) {
+      return const <String>[];
+    }
+    final result = <String>[];
+    final seen = <String>{};
+    for (final item in value) {
+      final text = item?.toString() ?? '';
+      if (text.isNotEmpty && seen.add(text)) {
+        result.add(text);
+      }
+    }
+    return result;
   }
 
   double _jsonDouble(Object? value, double fallback) {
@@ -909,6 +1000,158 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
       return value.toLowerCase() == 'true';
     }
     return fallback;
+  }
+
+  Future<bool> locateAsset(StoryboardCutAsset requestedAsset) async {
+    StoryboardCutAsset? asset;
+    StoryboardFolder? assetFolder;
+    for (final candidate in widget.state.assets) {
+      if (candidate.id == requestedAsset.id) {
+        asset = candidate;
+        break;
+      }
+    }
+    for (final folder in widget.state.folders) {
+      for (final candidate in folder.assets) {
+        if (candidate.id == requestedAsset.id) {
+          asset = candidate;
+          assetFolder = folder;
+          break;
+        }
+      }
+      if (assetFolder != null) {
+        break;
+      }
+    }
+    if (asset == null) {
+      for (final candidate in widget.state.assets) {
+        if (_sameLocatedAssetPath(candidate, requestedAsset)) {
+          asset = candidate;
+          break;
+        }
+      }
+      for (final folder in widget.state.folders) {
+        for (final candidate in folder.assets) {
+          if (_sameLocatedAssetPath(candidate, requestedAsset)) {
+            asset = candidate;
+            assetFolder = folder;
+            break;
+          }
+        }
+        if (assetFolder != null) {
+          break;
+        }
+      }
+    }
+    if (asset == null) {
+      return false;
+    }
+
+    final containingGroupIds = <String>{};
+    for (final group in widget.state.resourceGroups) {
+      if (group.assetIds.contains(asset.id) ||
+          group.sourceImageIds.contains(asset.imageId) ||
+          (assetFolder != null && group.folderIds.contains(assetFolder.id))) {
+        containingGroupIds.add(group.id);
+      }
+    }
+    final groupsById = {
+      for (final group in widget.state.resourceGroups) group.id: group,
+    };
+    for (final groupId in [...containingGroupIds]) {
+      var parentId = groupsById[groupId]?.parentGroupId;
+      while (parentId != null && containingGroupIds.add(parentId)) {
+        parentId = groupsById[parentId]?.parentGroupId;
+      }
+    }
+
+    setState(() {
+      _locatedAssetId = asset!.id;
+      if (assetFolder != null) {
+        _expandedFolders.add(assetFolder.id);
+      } else {
+        _expandedSources.add(asset.imageId);
+      }
+      _rangeAnchorAssetId = asset.id;
+      _rangeTargetAssetId = null;
+    });
+    for (final groupId in containingGroupIds) {
+      final group = groupsById[groupId];
+      if (group != null && !group.expanded) {
+        widget.onToggleResourceGroupExpanded(groupId);
+      }
+    }
+    _saveUiState();
+
+    await Future<void>.delayed(const Duration(milliseconds: 220));
+    return _scrollLocatedAssetIntoView();
+  }
+
+  bool _sameLocatedAssetPath(
+    StoryboardCutAsset candidate,
+    StoryboardCutAsset requested,
+  ) {
+    return p.normalize(candidate.path).toLowerCase() ==
+        p.normalize(requested.path).toLowerCase();
+  }
+
+  Key? _locatedGridKeyFor(List<StoryboardCutAsset> assets) {
+    final assetId = _locatedAssetId;
+    if (assetId == null) {
+      return null;
+    }
+    final index = assets.indexWhere((asset) => asset.id == assetId);
+    if (index < 0) {
+      return null;
+    }
+    _locatedAssetIndex = index;
+    return _locatedAssetGridKey;
+  }
+
+  Future<bool> _scrollLocatedAssetIntoView() async {
+    for (var attempt = 0; attempt < 6; attempt++) {
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) {
+        return false;
+      }
+      final gridContext = _locatedAssetGridKey.currentContext;
+      if (gridContext == null || !gridContext.mounted) {
+        continue;
+      }
+      final gridBox = gridContext.findRenderObject();
+      final scrollable = Scrollable.maybeOf(gridContext);
+      final viewportBox = scrollable?.position.context.storageContext
+          .findRenderObject();
+      if (gridBox is RenderBox &&
+          gridBox.hasSize &&
+          scrollable != null &&
+          viewportBox is RenderBox &&
+          viewportBox.hasSize) {
+        final columns = math.max(
+          1,
+          ((gridBox.size.width + 8) / (_thumbSize + 8)).floor(),
+        );
+        final row = _locatedAssetIndex ~/ columns;
+        final itemTop =
+            gridBox.localToGlobal(Offset.zero).dy + row * (_thumbSize + 8);
+        final viewportTop = viewportBox.localToGlobal(Offset.zero).dy;
+        final desiredTop =
+            viewportTop + (viewportBox.size.height - _thumbSize) / 2;
+        final position = scrollable.position;
+        final target = (position.pixels + itemTop - desiredTop)
+            .clamp(position.minScrollExtent, position.maxScrollExtent)
+            .toDouble();
+        if ((target - position.pixels).abs() > 1) {
+          await position.animateTo(
+            target,
+            duration: const Duration(milliseconds: 280),
+            curve: Curves.easeOutCubic,
+          );
+        }
+        return true;
+      }
+    }
+    return false;
   }
 
   @override
@@ -974,6 +1217,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
                   compact: constraints.maxWidth < 340,
                   allExpanded: allResourcesExpanded,
                   canToggleAll: hasExpandableResources,
+                  assetOrderAscending: _assetOrderAscending,
                   groupModeEnabled: _groupModeEnabled,
                   onToggleAll: () => _setAllResourcesExpanded(
                     expanded: !allResourcesExpanded,
@@ -981,6 +1225,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
                     folderIds: folderIds,
                   ),
                   onGroupModeChanged: _setGroupModeEnabled,
+                  onToggleAssetOrder: _toggleAssetOrder,
                   onCreateFolder: _createFolder,
                   onRefresh: widget.onRefresh,
                   onCollapse: widget.onCollapse,
@@ -1049,6 +1294,24 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
         _groupFolderIds.clear();
       }
     });
+  }
+
+  void _toggleAssetOrder() {
+    setState(() {
+      _assetOrderAscending = !_assetOrderAscending;
+      _rangeTargetAssetId = null;
+    });
+    _saveUiState();
+  }
+
+  void _toggleResourcePinned(String nodeKey) {
+    setState(() {
+      if (_pinnedResourceNodeKeys.remove(nodeKey)) {
+        return;
+      }
+      _pinnedResourceNodeKeys.insert(0, nodeKey);
+    });
+    _saveUiState();
   }
 
   void _setGroupSourceChecked(String sourceImageId, bool checked) {
@@ -1201,7 +1464,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
           id: folder.id,
           name: folder.name,
           path: folder.path,
-          assets: visibleAssets,
+          assets: _orderedAssetsForDisplay(visibleAssets),
         ),
       );
     }
@@ -1266,7 +1529,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
         }
       }
     }
-    return assets;
+    return _orderedAssetsForDisplay(assets);
   }
 
   List<StoryboardFolder> _foldersForResourceGroup(
@@ -1275,7 +1538,13 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     final folderIds = group.folderIds.toSet();
     return [
       for (final folder in widget.state.folders)
-        if (folderIds.contains(folder.id)) folder,
+        if (folderIds.contains(folder.id))
+          StoryboardFolder(
+            id: folder.id,
+            name: folder.name,
+            path: folder.path,
+            assets: _orderedAssetsForDisplay(folder.assets),
+          ),
     ];
   }
 
@@ -1283,13 +1552,28 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     StoryboardResourceGroup group,
   ) {
     final assetIds = group.assetIds.toSet();
-    return [
+    return _orderedAssetsForDisplay([
       for (final asset in widget.state.assets)
         if (assetIds.contains(asset.id)) asset,
       for (final folder in widget.state.folders)
         for (final asset in folder.assets)
           if (assetIds.contains(asset.id)) asset,
-    ];
+    ]);
+  }
+
+  List<StoryboardCutAsset> _orderedAssetsForDisplay(
+    Iterable<StoryboardCutAsset> assets,
+  ) {
+    final result = assets.toList()
+      ..sort((first, second) {
+        final byIndex = first.indexNo.compareTo(second.indexNo);
+        if (byIndex != 0) {
+          return byIndex;
+        }
+        final bySource = first.sourceName.compareTo(second.sourceName);
+        return bySource != 0 ? bySource : first.id.compareTo(second.id);
+      });
+    return _assetOrderAscending ? result : result.reversed.toList();
   }
 
   List<String> _rootResourceNodeKeys({
@@ -1305,7 +1589,9 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
       for (final sourceId in ungroupedSourceIds)
         StoryboardResourceNodeRef.source(sourceId).key,
     ];
-    return _orderedResourceNodeKeys(widget.state.resourceRootOrder, validKeys);
+    return _displayResourceNodeKeys(
+      _orderedResourceNodeKeys(widget.state.resourceRootOrder, validKeys),
+    );
   }
 
   List<String> _childResourceNodeKeys(StoryboardResourceGroup group) {
@@ -1318,7 +1604,27 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
       for (final sourceImageId in group.sourceImageIds)
         StoryboardResourceNodeRef.source(sourceImageId).key,
     ];
-    return _orderedResourceNodeKeys(group.childOrder, validKeys);
+    return _displayResourceNodeKeys(
+      _orderedResourceNodeKeys(group.childOrder, validKeys),
+    );
+  }
+
+  List<String> _displayResourceNodeKeys(Iterable<String> canonicalKeys) {
+    final canonical = canonicalKeys.toList();
+    final canonicalSet = canonical.toSet();
+    final pinned = [
+      for (final nodeKey in _pinnedResourceNodeKeys)
+        if (canonicalSet.contains(nodeKey)) nodeKey,
+    ];
+    final pinnedSet = pinned.toSet();
+    final unpinned = [
+      for (final nodeKey in canonical)
+        if (!pinnedSet.contains(nodeKey)) nodeKey,
+    ];
+    return [
+      ...pinned,
+      if (_assetOrderAscending) ...unpinned else ...unpinned.reversed,
+    ];
   }
 
   List<String> _orderedResourceNodeKeys(
@@ -1369,10 +1675,12 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
             continue;
           }
           final childKeys = _childResourceNodeKeys(group);
+          final directAssets = _directAssetsForResourceGroup(group);
           widgets.add(
             _ResourceGroupSection(
               group: group,
               sequence: sequence,
+              pinned: _pinnedResourceNodeKeys.contains(node.key),
               parentGroupId: parentGroupId,
               siblingKeys: nodeKeys,
               headerAssets: _assetsForResourceGroup(group),
@@ -1383,7 +1691,9 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
                     (child) => child?.kind == StoryboardResourceNodeKind.group,
                   )
                   .length,
-              directAssets: _directAssetsForResourceGroup(group),
+              directAssets: directAssets,
+              assetGridKey: _locatedGridKeyFor(directAssets),
+              focusedAssetId: _locatedAssetId,
               childNodes: _buildResourceNodes(
                 nodeKeys: childKeys,
                 sequencePrefix: sequence,
@@ -1397,6 +1707,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
               thumbnailSize: _thumbSize,
               onToggleExpanded: () =>
                   widget.onToggleResourceGroupExpanded(group.id),
+              onTogglePinned: () => _toggleResourcePinned(node.key),
               onToggleAsset: _toggleAsset,
               onRemoveAsset: _removeAsset,
               onRangeHover: _updateRangeTarget,
@@ -1417,10 +1728,17 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
           if (folder == null) {
             continue;
           }
+          final displayFolder = StoryboardFolder(
+            id: folder.id,
+            name: folder.name,
+            path: folder.path,
+            assets: _orderedAssetsForDisplay(folder.assets),
+          );
           widgets.add(
             _AssetFolderGroup(
-              folder: folder,
+              folder: displayFolder,
               sequence: sequence,
+              pinned: _pinnedResourceNodeKeys.contains(node.key),
               parentGroupId: parentGroupId,
               siblingKeys: nodeKeys,
               expanded: _expandedFolders.contains(folder.id),
@@ -1428,7 +1746,10 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
               previewIds: previewIds,
               previewAdding: _rangeAdding,
               thumbnailSize: _thumbSize,
+              assetGridKey: _locatedGridKeyFor(displayFolder.assets),
+              focusedAssetId: _locatedAssetId,
               onToggleExpanded: () => _toggleFolderExpanded(folder.id),
+              onTogglePinned: () => _toggleResourcePinned(node.key),
               onToggleAsset: _toggleAsset,
               onRemoveAsset: _removeAsset,
               onDeleteAsset: (asset) =>
@@ -1449,18 +1770,19 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
           final directAssetIds = {
             for (final group in widget.state.resourceGroups) ...group.assetIds,
           };
-          final assets = [
+          final assets = _orderedAssetsForDisplay([
             for (final asset in widget.state.assets)
               if (asset.imageId == node.id &&
                   !directAssetIds.contains(asset.id))
                 asset,
-          ];
+          ]);
           if (assets.isEmpty) {
             continue;
           }
           widgets.add(
             _AssetGroup(
               sequence: sequence,
+              pinned: _pinnedResourceNodeKeys.contains(node.key),
               parentGroupId: parentGroupId,
               siblingKeys: nodeKeys,
               title: assets.first.sourceName,
@@ -1470,7 +1792,10 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
               previewIds: previewIds,
               previewAdding: _rangeAdding,
               thumbnailSize: _thumbSize,
+              assetGridKey: _locatedGridKeyFor(assets),
+              focusedAssetId: _locatedAssetId,
               onToggleExpanded: () => _toggleExpanded(node.id),
+              onTogglePinned: () => _toggleResourcePinned(node.key),
               onToggleAsset: _toggleAsset,
               onRemoveAsset: _removeAsset,
               onRangeHover: _updateRangeTarget,
@@ -1744,16 +2069,18 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
           case StoryboardResourceNodeKind.folder:
             final folder = foldersById[node.id];
             if (folder != null && _expandedFolders.contains(folder.id)) {
-              addAssets(folder.assets);
+              addAssets(_orderedAssetsForDisplay(folder.assets));
             }
             break;
           case StoryboardResourceNodeKind.source:
             if (_expandedSources.contains(node.id)) {
               addAssets(
-                widget.state.assets.where(
-                  (asset) =>
-                      asset.imageId == node.id &&
-                      !directAssetIds.contains(asset.id),
+                _orderedAssetsForDisplay(
+                  widget.state.assets.where(
+                    (asset) =>
+                        asset.imageId == node.id &&
+                        !directAssetIds.contains(asset.id),
+                  ),
                 ),
               );
             }
@@ -1803,8 +2130,10 @@ class _AssetSidebarHeader extends StatelessWidget {
     required this.compact,
     required this.allExpanded,
     required this.canToggleAll,
+    required this.assetOrderAscending,
     required this.groupModeEnabled,
     required this.onToggleAll,
+    required this.onToggleAssetOrder,
     required this.onGroupModeChanged,
     required this.onCreateFolder,
     required this.onRefresh,
@@ -1814,8 +2143,10 @@ class _AssetSidebarHeader extends StatelessWidget {
   final bool compact;
   final bool allExpanded;
   final bool canToggleAll;
+  final bool assetOrderAscending;
   final bool groupModeEnabled;
   final VoidCallback onToggleAll;
+  final VoidCallback onToggleAssetOrder;
   final ValueChanged<bool> onGroupModeChanged;
   final VoidCallback onCreateFolder;
   final Future<void> Function() onRefresh;
@@ -1841,6 +2172,24 @@ class _AssetSidebarHeader extends StatelessWidget {
           size: 18,
         ),
         label: Text(allExpanded ? '收纳' : '展开'),
+        style: TextButton.styleFrom(
+          minimumSize: const Size(64, 36),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+        ),
+      ),
+    );
+    final toggleOrder = Tooltip(
+      message: assetOrderAscending ? '显示顺序：当前正序，点击切换为倒序' : '显示顺序：当前倒序，点击切换为正序',
+      child: TextButton.icon(
+        key: const ValueKey('resource-display-order-toggle'),
+        onPressed: onToggleAssetOrder,
+        icon: Icon(
+          assetOrderAscending
+              ? Icons.arrow_downward_rounded
+              : Icons.arrow_upward_rounded,
+          size: 17,
+        ),
+        label: Text(assetOrderAscending ? '正序' : '倒序'),
         style: TextButton.styleFrom(
           minimumSize: const Size(64, 36),
           padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -1874,6 +2223,7 @@ class _AssetSidebarHeader extends StatelessWidget {
         children: [
           Expanded(child: title),
           toggleAll,
+          toggleOrder,
           ...actions,
         ],
       );
@@ -1885,6 +2235,7 @@ class _AssetSidebarHeader extends StatelessWidget {
           children: [
             Expanded(child: title),
             toggleAll,
+            toggleOrder,
           ],
         ),
         Row(children: [const Spacer(), ...actions]),
@@ -1913,6 +2264,41 @@ class _CompactHeaderButton extends StatelessWidget {
       iconSize: 20,
       padding: EdgeInsets.zero,
       constraints: const BoxConstraints.tightFor(width: 36, height: 36),
+    );
+  }
+}
+
+class _ResourcePinButton extends StatelessWidget {
+  const _ResourcePinButton({
+    required this.nodeKey,
+    required this.pinned,
+    required this.onPressed,
+  });
+
+  final String nodeKey;
+  final bool pinned;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: pinned ? '取消置顶' : '置顶文件夹',
+      child: IconButton(
+        key: ValueKey('resource-pin-$nodeKey'),
+        onPressed: onPressed,
+        icon: Icon(pinned ? Icons.push_pin_rounded : Icons.push_pin_outlined),
+        iconSize: 17,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(width: 30, height: 30),
+        style: IconButton.styleFrom(
+          foregroundColor: pinned ? scheme.primary : scheme.onSurfaceVariant,
+          backgroundColor: pinned
+              ? scheme.primaryContainer.withValues(alpha: 0.62)
+              : Colors.transparent,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(7)),
+        ),
+      ),
     );
   }
 }
@@ -2188,18 +2574,22 @@ class _ResourceGroupSection extends StatelessWidget {
   const _ResourceGroupSection({
     required this.group,
     required this.sequence,
+    required this.pinned,
     required this.parentGroupId,
     required this.siblingKeys,
     required this.headerAssets,
     required this.headerFolders,
     required this.childGroupCount,
     required this.directAssets,
+    required this.assetGridKey,
+    required this.focusedAssetId,
     required this.childNodes,
     required this.usedIds,
     required this.previewIds,
     required this.previewAdding,
     required this.thumbnailSize,
     required this.onToggleExpanded,
+    required this.onTogglePinned,
     required this.onToggleAsset,
     required this.onRemoveAsset,
     required this.onRangeHover,
@@ -2210,18 +2600,22 @@ class _ResourceGroupSection extends StatelessWidget {
 
   final StoryboardResourceGroup group;
   final String sequence;
+  final bool pinned;
   final String? parentGroupId;
   final List<String> siblingKeys;
   final List<StoryboardCutAsset> headerAssets;
   final List<StoryboardFolder> headerFolders;
   final int childGroupCount;
   final List<StoryboardCutAsset> directAssets;
+  final Key? assetGridKey;
+  final String? focusedAssetId;
   final List<Widget> childNodes;
   final Set<String> usedIds;
   final Set<String> previewIds;
   final bool previewAdding;
   final double thumbnailSize;
   final VoidCallback onToggleExpanded;
+  final VoidCallback onTogglePinned;
   final ValueChanged<StoryboardCutAsset> onToggleAsset;
   final ValueChanged<StoryboardCutAsset> onRemoveAsset;
   final ValueChanged<StoryboardCutAsset> onRangeHover;
@@ -2248,11 +2642,13 @@ class _ResourceGroupSection extends StatelessWidget {
               child: _ResourceGroupHeader(
                 group: group,
                 sequence: sequence,
+                pinned: pinned,
                 assets: headerAssets,
                 folders: headerFolders,
                 childGroupCount: childGroupCount,
                 usedIds: usedIds,
                 onTap: onToggleExpanded,
+                onTogglePinned: onTogglePinned,
                 onRename: onRename,
               ),
             ),
@@ -2273,6 +2669,7 @@ class _ResourceGroupSection extends StatelessWidget {
                     const SizedBox(height: 4),
                   if (directAssets.isNotEmpty)
                     ViewportLazyGrid(
+                      key: assetGridKey,
                       itemCount: directAssets.length,
                       itemExtent: thumbnailSize,
                       crossAxisSpacing: 8,
@@ -2284,6 +2681,7 @@ class _ResourceGroupSection extends StatelessWidget {
                           used: usedIds.contains(asset.id),
                           rangePreviewed: previewIds.contains(asset.id),
                           rangeAdding: previewAdding,
+                          focused: asset.id == focusedAssetId,
                           size: thumbnailSize,
                           onTap: () => onToggleAsset(asset),
                           onSecondaryTap: () => onRemoveAsset(asset),
@@ -2374,21 +2772,25 @@ class _ResourceGroupHeader extends StatelessWidget {
   const _ResourceGroupHeader({
     required this.group,
     required this.sequence,
+    required this.pinned,
     required this.assets,
     required this.folders,
     required this.childGroupCount,
     required this.usedIds,
     required this.onTap,
+    required this.onTogglePinned,
     required this.onRename,
   });
 
   final StoryboardResourceGroup group;
   final String sequence;
+  final bool pinned;
   final List<StoryboardCutAsset> assets;
   final List<StoryboardFolder> folders;
   final int childGroupCount;
   final Set<String> usedIds;
   final VoidCallback onTap;
+  final VoidCallback onTogglePinned;
   final VoidCallback onRename;
 
   @override
@@ -2471,6 +2873,12 @@ class _ResourceGroupHeader extends StatelessWidget {
                   ],
                 ),
               ),
+              _ResourcePinButton(
+                nodeKey: StoryboardResourceNodeRef.group(group.id).key,
+                pinned: pinned,
+                onPressed: onTogglePinned,
+              ),
+              const SizedBox(width: 2),
               AnimatedRotation(
                 turns: group.expanded ? 0.5 : 0,
                 duration: const Duration(milliseconds: 180),
@@ -2658,6 +3066,7 @@ class _AssetFolderGroup extends StatefulWidget {
   const _AssetFolderGroup({
     required this.folder,
     required this.sequence,
+    required this.pinned,
     required this.parentGroupId,
     required this.siblingKeys,
     required this.expanded,
@@ -2665,7 +3074,10 @@ class _AssetFolderGroup extends StatefulWidget {
     required this.previewIds,
     required this.previewAdding,
     required this.thumbnailSize,
+    required this.assetGridKey,
+    required this.focusedAssetId,
     required this.onToggleExpanded,
+    required this.onTogglePinned,
     required this.onToggleAsset,
     required this.onRemoveAsset,
     required this.onDeleteAsset,
@@ -2679,6 +3091,7 @@ class _AssetFolderGroup extends StatefulWidget {
 
   final StoryboardFolder folder;
   final String sequence;
+  final bool pinned;
   final String? parentGroupId;
   final List<String> siblingKeys;
   final bool expanded;
@@ -2686,7 +3099,10 @@ class _AssetFolderGroup extends StatefulWidget {
   final Set<String> previewIds;
   final bool previewAdding;
   final double thumbnailSize;
+  final Key? assetGridKey;
+  final String? focusedAssetId;
   final VoidCallback onToggleExpanded;
+  final VoidCallback onTogglePinned;
   final ValueChanged<StoryboardCutAsset> onToggleAsset;
   final ValueChanged<StoryboardCutAsset> onRemoveAsset;
   final ValueChanged<StoryboardCutAsset> onDeleteAsset;
@@ -2733,10 +3149,12 @@ class _AssetFolderGroupState extends State<_AssetFolderGroup> {
                     child: _FolderHeader(
                       folder: widget.folder,
                       sequence: widget.sequence,
+                      pinned: widget.pinned,
                       expanded: widget.expanded,
                       highlighted: highlighted,
                       usedIds: widget.usedIds,
                       onTap: widget.onToggleExpanded,
+                      onTogglePinned: widget.onTogglePinned,
                       onOpenDirectory: widget.onOpenDirectory,
                     ),
                   ),
@@ -2752,6 +3170,7 @@ class _AssetFolderGroupState extends State<_AssetFolderGroup> {
                     child: widget.folder.assets.isEmpty
                         ? _EmptyFolderHint(highlighted: highlighted)
                         : ViewportLazyGrid(
+                            key: widget.assetGridKey,
                             itemCount: widget.folder.assets.length,
                             itemExtent: widget.thumbnailSize,
                             crossAxisSpacing: 8,
@@ -2765,6 +3184,7 @@ class _AssetFolderGroupState extends State<_AssetFolderGroup> {
                                   asset.id,
                                 ),
                                 rangeAdding: widget.previewAdding,
+                                focused: asset.id == widget.focusedAssetId,
                                 size: widget.thumbnailSize,
                                 onTap: () => widget.onToggleAsset(asset),
                                 onSecondaryTap: () =>
@@ -2791,19 +3211,23 @@ class _FolderHeader extends StatelessWidget {
   const _FolderHeader({
     required this.folder,
     required this.sequence,
+    required this.pinned,
     required this.expanded,
     required this.highlighted,
     required this.usedIds,
     required this.onTap,
+    required this.onTogglePinned,
     required this.onOpenDirectory,
   });
 
   final StoryboardFolder folder;
   final String sequence;
+  final bool pinned;
   final bool expanded;
   final bool highlighted;
   final Set<String> usedIds;
   final VoidCallback onTap;
+  final VoidCallback onTogglePinned;
   final VoidCallback onOpenDirectory;
 
   @override
@@ -2864,8 +3288,10 @@ class _FolderHeader extends StatelessWidget {
                 ),
                 const SizedBox(width: 4),
               ],
-              _FolderPreview(folder: folder),
-              const SizedBox(width: 8),
+              if (!groupModeEnabled) ...[
+                _FolderPreview(folder: folder),
+                const SizedBox(width: 8),
+              ],
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -2890,6 +3316,12 @@ class _FolderHeader extends StatelessWidget {
                   ],
                 ),
               ),
+              _ResourcePinButton(
+                nodeKey: StoryboardResourceNodeRef.folder(folder.id).key,
+                pinned: pinned,
+                onPressed: onTogglePinned,
+              ),
+              const SizedBox(width: 2),
               AnimatedRotation(
                 turns: expanded ? 0.5 : 0,
                 duration: const Duration(milliseconds: 180),
@@ -3016,6 +3448,7 @@ class _EmptyFolderHint extends StatelessWidget {
 class _AssetGroup extends StatelessWidget {
   const _AssetGroup({
     required this.sequence,
+    required this.pinned,
     required this.parentGroupId,
     required this.siblingKeys,
     required this.title,
@@ -3025,7 +3458,10 @@ class _AssetGroup extends StatelessWidget {
     required this.previewIds,
     required this.previewAdding,
     required this.thumbnailSize,
+    required this.assetGridKey,
+    required this.focusedAssetId,
     required this.onToggleExpanded,
+    required this.onTogglePinned,
     required this.onToggleAsset,
     required this.onRemoveAsset,
     required this.onRangeHover,
@@ -3035,6 +3471,7 @@ class _AssetGroup extends StatelessWidget {
   });
 
   final String sequence;
+  final bool pinned;
   final String? parentGroupId;
   final List<String> siblingKeys;
   final String title;
@@ -3044,7 +3481,10 @@ class _AssetGroup extends StatelessWidget {
   final Set<String> previewIds;
   final bool previewAdding;
   final double thumbnailSize;
+  final Key? assetGridKey;
+  final String? focusedAssetId;
   final VoidCallback onToggleExpanded;
+  final VoidCallback onTogglePinned;
   final ValueChanged<StoryboardCutAsset> onToggleAsset;
   final ValueChanged<StoryboardCutAsset> onRemoveAsset;
   final ValueChanged<StoryboardCutAsset> onRangeHover;
@@ -3128,16 +3568,18 @@ class _AssetGroup extends StatelessWidget {
                           ),
                           const SizedBox(width: 4),
                         ],
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(6),
-                          child: Image.file(
-                            File(firstAsset.path),
-                            width: 36,
-                            height: 36,
-                            fit: BoxFit.cover,
+                        if (!groupModeEnabled) ...[
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(6),
+                            child: Image.file(
+                              File(firstAsset.path),
+                              width: 36,
+                              height: 36,
+                              fit: BoxFit.cover,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 6),
+                          const SizedBox(width: 6),
+                        ],
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -3163,6 +3605,14 @@ class _AssetGroup extends StatelessWidget {
                             ],
                           ),
                         ),
+                        _ResourcePinButton(
+                          nodeKey: StoryboardResourceNodeRef.source(
+                            firstAsset.imageId,
+                          ).key,
+                          pinned: pinned,
+                          onPressed: onTogglePinned,
+                        ),
+                        const SizedBox(width: 2),
                         AnimatedRotation(
                           turns: expanded ? 0.5 : 0,
                           duration: const Duration(milliseconds: 180),
@@ -3171,26 +3621,28 @@ class _AssetGroup extends StatelessWidget {
                             color: scheme.onSurfaceVariant,
                           ),
                         ),
-                        const SizedBox(width: 2),
-                        Tooltip(
-                          message: '删除这组裁切资源',
-                          child: IconButton(
-                            onPressed: onDeleteGroup,
-                            icon: const Icon(Icons.delete_outline_rounded),
-                            iconSize: 18,
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints.tightFor(
-                              width: 30,
-                              height: 30,
-                            ),
-                            style: IconButton.styleFrom(
-                              foregroundColor: scheme.error,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(7),
+                        if (!groupModeEnabled) ...[
+                          const SizedBox(width: 2),
+                          Tooltip(
+                            message: '删除这组裁切资源',
+                            child: IconButton(
+                              onPressed: onDeleteGroup,
+                              icon: const Icon(Icons.delete_outline_rounded),
+                              iconSize: 18,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints.tightFor(
+                                width: 30,
+                                height: 30,
+                              ),
+                              style: IconButton.styleFrom(
+                                foregroundColor: scheme.error,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(7),
+                                ),
                               ),
                             ),
                           ),
-                        ),
+                        ],
                       ],
                     ),
                   ),
@@ -3207,6 +3659,7 @@ class _AssetGroup extends StatelessWidget {
             secondChild: Padding(
               padding: const EdgeInsets.only(top: 8),
               child: ViewportLazyGrid(
+                key: assetGridKey,
                 itemCount: assets.length,
                 itemExtent: thumbnailSize,
                 crossAxisSpacing: 8,
@@ -3218,6 +3671,7 @@ class _AssetGroup extends StatelessWidget {
                     used: usedIds.contains(asset.id),
                     rangePreviewed: previewIds.contains(asset.id),
                     rangeAdding: previewAdding,
+                    focused: asset.id == focusedAssetId,
                     size: thumbnailSize,
                     onTap: () => onToggleAsset(asset),
                     onSecondaryTap: () => onRemoveAsset(asset),
@@ -3241,6 +3695,7 @@ class _AssetThumb extends StatelessWidget {
     required this.used,
     required this.rangePreviewed,
     required this.rangeAdding,
+    this.focused = false,
     required this.size,
     required this.onTap,
     required this.onSecondaryTap,
@@ -3253,6 +3708,7 @@ class _AssetThumb extends StatelessWidget {
   final bool used;
   final bool rangePreviewed;
   final bool rangeAdding;
+  final bool focused;
   final double size;
   final VoidCallback onTap;
   final VoidCallback onSecondaryTap;
@@ -3272,12 +3728,16 @@ class _AssetThumb extends StatelessWidget {
     final groupSelection = _ResourceGroupSelectionScope.maybeOf(context);
     final groupModeEnabled = groupSelection?.enabled ?? false;
     final previewColor = rangeAdding ? scheme.primary : scheme.error;
-    final fillColor = used
+    final fillColor = focused
+        ? scheme.tertiaryContainer.withValues(alpha: 0.88)
+        : used
         ? scheme.primaryContainer.withValues(alpha: 0.75)
         : rangePreviewed
         ? previewColor.withValues(alpha: 0.22)
         : scheme.surfaceContainerHighest.withValues(alpha: 0.42);
-    final borderColor = used
+    final borderColor = focused
+        ? scheme.tertiary
+        : used
         ? scheme.primary.withValues(alpha: 0.58)
         : rangePreviewed
         ? previewColor.withValues(alpha: 0.92)
@@ -3302,14 +3762,24 @@ class _AssetThumb extends StatelessWidget {
               borderRadius: BorderRadius.circular(8),
               border: Border.all(
                 color: borderColor,
-                width: rangePreviewed ? 2 : 1,
+                width: focused
+                    ? 3
+                    : rangePreviewed
+                    ? 2
+                    : 1,
               ),
-              boxShadow: used || rangePreviewed
+              boxShadow: focused || used || rangePreviewed
                   ? [
                       BoxShadow(
-                        color: (rangePreviewed ? previewColor : scheme.primary)
-                            .withValues(alpha: 0.18),
-                        blurRadius: 16,
+                        color:
+                            (focused
+                                    ? scheme.tertiary
+                                    : rangePreviewed
+                                    ? previewColor
+                                    : scheme.primary)
+                                .withValues(alpha: focused ? 0.42 : 0.18),
+                        blurRadius: focused ? 24 : 16,
+                        spreadRadius: focused ? 2 : 0,
                       ),
                     ]
                   : null,
@@ -3325,6 +3795,25 @@ class _AssetThumb extends StatelessWidget {
                     gaplessPlayback: true,
                   ),
                 ),
+                if (focused)
+                  Positioned(
+                    left: 3,
+                    top: 3,
+                    child: Container(
+                      width: 20,
+                      height: 20,
+                      decoration: BoxDecoration(
+                        color: scheme.tertiary,
+                        borderRadius: BorderRadius.circular(5),
+                      ),
+                      child: Icon(
+                        Icons.my_location_rounded,
+                        key: ValueKey('asset-located-${asset.id}'),
+                        size: 14,
+                        color: scheme.onTertiary,
+                      ),
+                    ),
+                  ),
                 if (!groupModeEnabled && rangePreviewed)
                   Positioned(
                     left: 3,
@@ -3512,6 +4001,7 @@ class _StoryboardCanvas extends StatelessWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onLocateAsset,
     required this.onPickReplacementImage,
     required this.onDropReplacementImages,
     required this.onCaptionChanged,
@@ -3533,6 +4023,7 @@ class _StoryboardCanvas extends StatelessWidget {
   final ValueChanged<int> onFlipHorizontal;
   final ValueChanged<int> onFlipVertical;
   final ValueChanged<StoryboardItem> onEditImage;
+  final ValueChanged<StoryboardItem> onLocateAsset;
   final ValueChanged<StoryboardItem> onPickReplacementImage;
   final void Function(StoryboardItem item, Iterable<String> paths)
   onDropReplacementImages;
@@ -3673,6 +4164,7 @@ class _StoryboardCanvas extends StatelessWidget {
                     onFlipHorizontal: onFlipHorizontal,
                     onFlipVertical: onFlipVertical,
                     onEditImage: onEditImage,
+                    onLocateAsset: onLocateAsset,
                     onPickReplacementImage: onPickReplacementImage,
                     onDropReplacementImages: onDropReplacementImages,
                     onCaptionChanged: onCaptionChanged,
@@ -3782,6 +4274,7 @@ class _StoryboardCanvasViewport extends StatefulWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onLocateAsset,
     required this.onPickReplacementImage,
     required this.onDropReplacementImages,
     required this.onCaptionChanged,
@@ -3797,6 +4290,7 @@ class _StoryboardCanvasViewport extends StatefulWidget {
   final ValueChanged<int> onFlipHorizontal;
   final ValueChanged<int> onFlipVertical;
   final ValueChanged<StoryboardItem> onEditImage;
+  final ValueChanged<StoryboardItem> onLocateAsset;
   final ValueChanged<StoryboardItem> onPickReplacementImage;
   final void Function(StoryboardItem item, Iterable<String> paths)
   onDropReplacementImages;
@@ -3987,6 +4481,7 @@ class _StoryboardCanvasViewportState extends State<_StoryboardCanvasViewport> {
               onFlipHorizontal: widget.onFlipHorizontal,
               onFlipVertical: widget.onFlipVertical,
               onEditImage: widget.onEditImage,
+              onLocateAsset: widget.onLocateAsset,
               onPickReplacementImage: widget.onPickReplacementImage,
               onDropReplacementImages: widget.onDropReplacementImages,
               onCaptionChanged: widget.onCaptionChanged,
@@ -4557,6 +5052,7 @@ class _CanvasGrid extends ConsumerStatefulWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onLocateAsset,
     required this.onPickReplacementImage,
     required this.onDropReplacementImages,
     required this.onCaptionChanged,
@@ -4574,6 +5070,7 @@ class _CanvasGrid extends ConsumerStatefulWidget {
   final ValueChanged<int> onFlipHorizontal;
   final ValueChanged<int> onFlipVertical;
   final ValueChanged<StoryboardItem> onEditImage;
+  final ValueChanged<StoryboardItem> onLocateAsset;
   final ValueChanged<StoryboardItem> onPickReplacementImage;
   final void Function(StoryboardItem item, Iterable<String> paths)
   onDropReplacementImages;
@@ -4940,6 +5437,8 @@ class _CanvasGridState extends ConsumerState<_CanvasGrid> {
                           onFlipVertical: () =>
                               widget.onFlipVertical(selectedItem!.slotIndex),
                           onEditImage: () => widget.onEditImage(selectedItem!),
+                          onLocateAsset: () =>
+                              widget.onLocateAsset(selectedItem!),
                           onPickReplacementImage: () =>
                               widget.onPickReplacementImage(selectedItem!),
                         ),
@@ -5751,7 +6250,7 @@ class _SelectedImageToolbarPositioner extends StatelessWidget {
     required this.child,
   });
 
-  static const _width = 176.0;
+  static const _width = 210.0;
   static const _height = 36.0;
 
   final Rect rect;
@@ -5780,6 +6279,7 @@ class _ImageQuickActions extends StatelessWidget {
     required this.onFlipHorizontal,
     required this.onFlipVertical,
     required this.onEditImage,
+    required this.onLocateAsset,
     required this.onPickReplacementImage,
   });
 
@@ -5788,6 +6288,7 @@ class _ImageQuickActions extends StatelessWidget {
   final VoidCallback onFlipHorizontal;
   final VoidCallback onFlipVertical;
   final VoidCallback onEditImage;
+  final VoidCallback onLocateAsset;
   final VoidCallback onPickReplacementImage;
 
   @override
@@ -5815,6 +6316,12 @@ class _ImageQuickActions extends StatelessWidget {
               selected: false,
               icon: Icons.image_search_rounded,
               onPressed: onPickReplacementImage,
+            ),
+            _ImageQuickActionButton(
+              tooltip: '打开图片路径',
+              selected: false,
+              icon: Icons.folder_open_rounded,
+              onPressed: onLocateAsset,
             ),
             _ImageQuickActionButton(
               tooltip: '水平翻转',
@@ -5876,11 +6383,17 @@ class _ImageEditDialog extends StatefulWidget {
     required this.controller,
     required this.item,
     required this.initialModel,
+    required this.initialAspectRatio,
+    required this.initialImageSize,
+    required this.onPreferencesChanged,
   });
 
   final StoryboardController controller;
   final StoryboardItem item;
   final String initialModel;
+  final String initialAspectRatio;
+  final String initialImageSize;
+  final ValueChanged<StoryboardImageEditPreferences>? onPreferencesChanged;
 
   @override
   State<_ImageEditDialog> createState() => _ImageEditDialogState();
@@ -5894,11 +6407,10 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
 
   late final TextEditingController _promptController;
   late String _model;
-  String _aspectRatio = 'auto';
-  String _imageSize = '1K';
+  late String _aspectRatio;
+  late String _imageSize;
   String _quality = 'auto';
   final _referenceImagePaths = <String>[];
-  bool _isGenerating = false;
   bool _isSuggesting = false;
   String _statusText = '';
 
@@ -5910,6 +6422,8 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
         ImageGenerationModelCatalog.values.contains(widget.initialModel.trim())
         ? widget.initialModel.trim()
         : 'nano-banana-fast';
+    _aspectRatio = widget.initialAspectRatio;
+    _imageSize = widget.initialImageSize;
     _normalizeSelections();
   }
 
@@ -5970,7 +6484,7 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
     return GptImageGenerationPreset.qualityOptions;
   }
 
-  bool get _busy => _isGenerating || _isSuggesting;
+  bool get _busy => _isSuggesting;
 
   @override
   Widget build(BuildContext context) {
@@ -6143,26 +6657,14 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
         ),
       ),
       actions: [
-        if (_isGenerating)
-          TextButton.icon(
-            onPressed: () => Navigator.of(context).pop(),
-            icon: const Icon(Icons.minimize_rounded),
-            label: const Text('最小化'),
-          ),
         TextButton(
           onPressed: _busy ? null : () => Navigator.of(context).pop(),
           child: const Text('取消'),
         ),
         FilledButton.icon(
           onPressed: _busy ? null : _generate,
-          icon: _isGenerating
-              ? const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : const Icon(Icons.auto_fix_high_rounded),
-          label: Text(_isGenerating ? '生成中...' : '生成'),
+          icon: const Icon(Icons.auto_fix_high_rounded),
+          label: const Text('生成'),
         ),
       ],
     );
@@ -6333,12 +6835,8 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
     }
   }
 
-  Future<void> _generate() async {
-    setState(() {
-      _isGenerating = true;
-      _statusText = '正在生成图片...';
-    });
-    final ok = await widget.controller.generateReplacementForItem(
+  void _generate() {
+    final accepted = widget.controller.enqueueReplacementForItem(
       item: widget.item,
       prompt: _promptController.text,
       model: _model,
@@ -6347,15 +6845,12 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
       quality: _quality,
       extraReferenceImagePaths: _referenceImagePaths,
     );
-    if (!mounted) {
-      return;
-    }
-    if (ok) {
+    if (accepted) {
+      _persistPreferences();
       Navigator.of(context).pop();
       return;
     }
     setState(() {
-      _isGenerating = false;
       _statusText = widget.controller.value.message;
     });
   }
@@ -6365,6 +6860,7 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
       _model = model;
       _normalizeSelections();
     });
+    _persistPreferences();
   }
 
   void _setAspectRatio(String aspectRatio) {
@@ -6372,6 +6868,7 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
       _aspectRatio = aspectRatio;
       _normalizeSelections();
     });
+    _persistPreferences();
   }
 
   void _setImageSize(String imageSize) {
@@ -6379,12 +6876,23 @@ class _ImageEditDialogState extends State<_ImageEditDialog> {
       _imageSize = imageSize;
       _normalizeSelections();
     });
+    _persistPreferences();
   }
 
   void _setQuality(String quality) {
     setState(() {
       _quality = GptImageGenerationPreset.normalizeQuality(quality);
     });
+  }
+
+  void _persistPreferences() {
+    widget.onPreferencesChanged?.call(
+      StoryboardImageEditPreferences(
+        model: _model,
+        aspectRatio: _aspectRatio,
+        imageSize: _imageSize,
+      ),
+    );
   }
 
   void _normalizeSelections() {

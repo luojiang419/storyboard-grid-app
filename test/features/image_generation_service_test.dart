@@ -230,6 +230,7 @@ void main() {
 
     Map<String, dynamic>? submitBody;
     final resultBytes = img.encodePng(img.Image(width: 4, height: 4));
+    final thoughtSignature = 'opaque-signature-' * 128;
     final service = ImageGenerationService(
       client: MockClient((request) async {
         expect(request.url.host, 'www.shiying-api.com');
@@ -246,6 +247,7 @@ void main() {
                 'content': {
                   'parts': [
                     {
+                      'thoughtSignature': thoughtSignature,
                       'inlineData': {
                         'mimeType': 'image/png',
                         'data': base64Encode(resultBytes),
@@ -253,8 +255,15 @@ void main() {
                     },
                   ],
                 },
+                'finishReason': 'STOP',
               },
             ],
+            'usageMetadata': {
+              'promptTokenCount': 12,
+              'candidatesTokenCount': 34,
+            },
+            'modelVersion': 'gemini-3-pro-image-preview',
+            'responseId': 'response-compact-test',
           }),
           200,
           headers: {'content-type': 'application/json'},
@@ -290,7 +299,32 @@ void main() {
     );
     expect(result.remoteUrl, isEmpty);
     expect(await File(result.localPath).readAsBytes(), resultBytes);
-    expect(File('${result.localPath}.json').existsSync(), isTrue);
+    final metadataFile = File('${result.localPath}.json');
+    expect(metadataFile.existsSync(), isTrue);
+    final compactResponse =
+        jsonDecode(result.rawResponse) as Map<String, dynamic>;
+    expect(compactResponse['responseId'], 'response-compact-test');
+    expect(compactResponse['modelVersion'], 'gemini-3-pro-image-preview');
+    expect(compactResponse['usageMetadata'], isNotNull);
+    expect(
+      ((compactResponse['candidates'] as List).single as Map)['finishReason'],
+      'STOP',
+    );
+    expect(result.rawResponse, isNot(contains(base64Encode(resultBytes))));
+    expect(result.rawResponse, isNot(contains(thoughtSignature)));
+    expect(result.rawResponse, isNot(contains('thoughtSignature')));
+    expect(
+      compactResponse['payloadOmissions'],
+      containsPair('imagePayloadCharacters', base64Encode(resultBytes).length),
+    );
+    expect(
+      compactResponse['payloadOmissions'],
+      containsPair('opaqueSignatureCharacters', thoughtSignature.length),
+    );
+    final metadata =
+        jsonDecode(await metadataFile.readAsString()) as Map<String, dynamic>;
+    expect(metadata['rawResponse'], result.rawResponse);
+    expect(await metadataFile.length(), lessThan(2048));
   });
 
   test('图片修改仍然要求至少一张参考图', () async {
