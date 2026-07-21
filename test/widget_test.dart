@@ -411,6 +411,31 @@ void main() {
       expect(find.byKey(ValueKey('asset-thumb-$assetId')), findsOneWidget);
     }
 
+    final nestedSourceHeader = find.byKey(
+      ValueKey(
+        'resource-node-draggable-${StoryboardResourceNodeRef.source(imageId).key}',
+      ),
+    );
+    expect(nestedSourceHeader, findsOneWidget);
+    if (find
+        .byKey(ValueKey('asset-thumb-${assetIds.first}'))
+        .hitTestable()
+        .evaluate()
+        .isNotEmpty) {
+      await tester.tap(nestedSourceHeader);
+      await tester.pumpAndSettle();
+    }
+    expect(
+      find.byKey(ValueKey('asset-thumb-${assetIds.first}')).hitTestable(),
+      findsNothing,
+    );
+    await tester.tap(nestedSourceHeader);
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(ValueKey('asset-thumb-${assetIds.first}')).hitTestable(),
+      findsOneWidget,
+    );
+
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -636,6 +661,11 @@ void main() {
     expect(controller.value.selectedBoard!.rows, 2);
     expect(controller.value.selectedBoard!.columns, 2);
 
+    await _sendControlShortcut(tester, LogicalKeyboardKey.keyZ);
+    expect(controller.value.selectedBoard!.rows, 3);
+    await _sendControlShortcut(tester, LogicalKeyboardKey.keyY);
+    expect(controller.value.selectedBoard!.rows, 2);
+
     await _sendControlShortcut(tester, LogicalKeyboardKey.tab);
     expect(controller.value.selectedBoardId, firstBoardId);
 
@@ -645,6 +675,106 @@ void main() {
     expect(controller.value.selectedBoardId, secondBoardId);
 
     await tester.pump(const Duration(milliseconds: 150));
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
+  testWidgets('左侧裁切资源真实拖入格子后可通过按钮撤销和恢复', (tester) async {
+    tester.view.physicalSize = const Size(1600, 1000);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    late final Directory root;
+    late final AppDatabase database;
+    late final StoryboardController controller;
+    const imageId = 'drag-source-image';
+    const assetId = 'drag-source-asset';
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp('storyboard_drag_undo_');
+      database = await AppDatabase.open(
+        File('${root.path}${Platform.pathSeparator}storyboard.sqlite'),
+      );
+      final image = File(
+        '${root.path}${Platform.pathSeparator}drag-source.png',
+      );
+      await image.writeAsBytes(base64Decode(_onePixelPng));
+      final now = DateTime.now().toIso8601String();
+      database
+        ..upsertImportedImage(
+          id: imageId,
+          originalPath: image.path,
+          originalName: '拖拽测试图',
+          storedPath: image.path,
+          width: 1,
+          height: 1,
+          createdAt: now,
+        )
+        ..upsertCutTask(
+          id: 'drag-source-task',
+          imageId: imageId,
+          status: 'exported',
+          rows: 1,
+          columns: 1,
+          confidence: 1,
+        )
+        ..insertCutResult(
+          id: assetId,
+          taskId: 'drag-source-task',
+          imageId: imageId,
+          indexNo: 1,
+          path: image.path,
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 1,
+          selected: true,
+        );
+      controller = StoryboardController(database: database);
+      await controller.refreshAssets();
+    });
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [storyboardControllerProvider.overrideWithValue(controller)],
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('拖拽测试图'));
+    await tester.pumpAndSettle();
+
+    final source = find.byKey(const ValueKey('asset-thumb-drag-source-asset'));
+    final target = find.byKey(const ValueKey('storyboard-empty-slot-0'));
+    expect(source.hitTestable(), findsOneWidget);
+    expect(target.hitTestable(), findsOneWidget);
+    await tester.timedDragFrom(
+      tester.getCenter(source),
+      tester.getCenter(target) - tester.getCenter(source),
+      const Duration(milliseconds: 500),
+    );
+    await tester.pumpAndSettle();
+
+    expect(controller.value.selectedBoard!.itemAtSlot(0)?.asset.id, assetId);
+    final undoButton = find.byKey(const ValueKey('storyboard-undo'));
+    expect(tester.widget<IconButton>(undoButton).onPressed, isNotNull);
+    await tester.tap(undoButton);
+    await tester.pumpAndSettle();
+    expect(controller.value.selectedBoard!.items, isEmpty);
+
+    final redoButton = find.byKey(const ValueKey('storyboard-redo'));
+    expect(tester.widget<IconButton>(redoButton).onPressed, isNotNull);
+    await tester.tap(redoButton);
+    await tester.pumpAndSettle();
+    expect(controller.value.selectedBoard!.itemAtSlot(0)?.asset.id, assetId);
+
     await tester.pumpWidget(const SizedBox.shrink());
   });
 
@@ -1123,6 +1253,116 @@ void main() {
     await tester.pump();
     expect(find.text('请拖入 PNG、JPG、WEBP 或 BMP 图片'), findsOneWidget);
     expect(controller.value.selectedBoard!.itemAtSlot(0)!.asset.id, 'asset-1');
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    PaintingBinding.instance.imageCache
+      ..clear()
+      ..clearLiveImages();
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+
+  testWidgets('替换图片从右键菜单取消使用后可撤回恢复', (tester) async {
+    late final Directory root;
+    late final AppDirectories directories;
+    late final AppDatabase database;
+    late final SettingsController settingsController;
+    late final File replacementSource;
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp(
+        'storyboard_replace_remove_widget_',
+      );
+      directories = await AppDirectories.create(executableDirectory: root);
+      database = await AppDatabase.open(directories.databaseFile);
+      final repository = SettingsRepository(database, directories);
+      settingsController = SettingsController(
+        repository: repository,
+        initialSettings: repository.load(),
+      );
+      replacementSource = File(
+        '${root.path}${Platform.pathSeparator}右键取消使用.png',
+      );
+      await replacementSource.writeAsBytes(
+        img.encodePng(img.Image(width: 3, height: 2)),
+      );
+    });
+
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+      settingsController: settingsController,
+    );
+    controller.setAssetsUsed([
+      StoryboardCutAsset(
+        id: 'asset-1',
+        imageId: 'image-1',
+        sourceName: '原图片.png',
+        path: replacementSource.path,
+        indexNo: 1,
+      ),
+    ], true);
+    controller.updateCaption(0, '右键取消后恢复说明');
+    controller.toggleItemFlipVertical(0);
+    late final StoryboardItem replacement;
+    await tester.runAsync(() async {
+      final original = controller.value.selectedBoard!.itemAtSlot(0)!;
+      expect(
+        await controller.replaceItemImage(
+          item: original,
+          imagePath: replacementSource.path,
+        ),
+        isTrue,
+      );
+      replacement = controller.value.selectedBoard!.itemAtSlot(0)!;
+      await replacementSource.delete();
+    });
+    addTearDown(() async {
+      controller.dispose();
+      settingsController.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          storyboardControllerProvider.overrideWithValue(controller),
+          settingsControllerProvider.overrideWithValue(settingsController),
+        ],
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('手动替换_右键取消使用.png'));
+    await tester.pumpAndSettle();
+    final replacementThumb = find.byKey(
+      ValueKey('asset-thumb-${replacement.asset.id}'),
+    );
+    expect(replacementThumb, findsOneWidget);
+    await tester.tap(replacementThumb, buttons: kSecondaryMouseButton);
+    await tester.pumpAndSettle();
+    expect(find.text('取消使用'), findsOneWidget);
+
+    await tester.tap(find.text('取消使用'));
+    await tester.pumpAndSettle();
+    expect(controller.value.selectedBoard!.items, isEmpty);
+    expect(controller.value.message, '已取消使用图片，可撤回恢复（最多100步）');
+
+    controller.undoSelectedBoard();
+    await tester.pumpAndSettle();
+    final restored = controller.value.selectedBoard!.itemAtSlot(0)!;
+    expect(restored.asset.id, replacement.asset.id);
+    expect(File(restored.asset.path).existsSync(), isTrue);
+    expect(restored.caption, '右键取消后恢复说明');
+    expect(restored.flipVertical, isTrue);
+
+    controller.redoSelectedBoard();
+    await tester.pumpAndSettle();
+    expect(controller.value.selectedBoard!.items, isEmpty);
 
     await tester.pumpWidget(const SizedBox.shrink());
     PaintingBinding.instance.imageCache

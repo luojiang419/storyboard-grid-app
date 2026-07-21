@@ -268,6 +268,10 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
                                 controller: controller,
                               ),
                               onAddBoard: controller.addBoard,
+                              canUndo: controller.canUndoSelectedBoard,
+                              canRedo: controller.canRedoSelectedBoard,
+                              onUndo: controller.undoSelectedBoard,
+                              onRedo: controller.redoSelectedBoard,
                               onToggleLock: controller.toggleSelectedBoardLock,
                               onMove: controller.moveItem,
                               onMoveItems: controller.moveItems,
@@ -336,6 +340,8 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
           control: true,
           shift: true,
         ): controller.redoSelectedBoard,
+        const SingleActivator(LogicalKeyboardKey.keyY, control: true):
+            controller.redoSelectedBoard,
         const SingleActivator(LogicalKeyboardKey.keyW, control: true):
             controller.closeSelectedBoard,
         const SingleActivator(LogicalKeyboardKey.tab, control: true):
@@ -914,7 +920,8 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
     for (final asset in ungroupedAssets) {
       groups.putIfAbsent(asset.imageId, () => []).add(asset);
     }
-    _expandedSources.removeWhere((source) => !groups.containsKey(source));
+    final sourceIds = widget.state.assets.map((asset) => asset.imageId).toSet();
+    _expandedSources.removeWhere((source) => !sourceIds.contains(source));
     final folderIds = widget.state.folders.map((folder) => folder.id).toSet();
     _expandedFolders.removeWhere((folder) => !folderIds.contains(folder));
     final visibleAssets = _visibleAssets(
@@ -944,7 +951,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
         widget.state.resourceGroups.isNotEmpty;
     final allResourcesExpanded =
         hasExpandableResources &&
-        groups.keys.every(_expandedSources.contains) &&
+        sourceIds.every(_expandedSources.contains) &&
         folderIds.every(_expandedFolders.contains) &&
         widget.state.resourceGroups.every((group) => group.expanded);
 
@@ -970,7 +977,7 @@ class _AssetSidebarState extends ConsumerState<_AssetSidebar> {
                   groupModeEnabled: _groupModeEnabled,
                   onToggleAll: () => _setAllResourcesExpanded(
                     expanded: !allResourcesExpanded,
-                    sourceIds: groups.keys,
+                    sourceIds: sourceIds,
                     folderIds: folderIds,
                   ),
                   onGroupModeChanged: _setGroupModeEnabled,
@@ -3493,6 +3500,10 @@ class _StoryboardCanvas extends StatelessWidget {
     required this.state,
     required this.onManageBoards,
     required this.onAddBoard,
+    required this.canUndo,
+    required this.canRedo,
+    required this.onUndo,
+    required this.onRedo,
     required this.onToggleLock,
     required this.onMove,
     required this.onMoveItems,
@@ -3510,6 +3521,10 @@ class _StoryboardCanvas extends StatelessWidget {
   final StoryboardState state;
   final VoidCallback onManageBoards;
   final VoidCallback onAddBoard;
+  final bool canUndo;
+  final bool canRedo;
+  final VoidCallback onUndo;
+  final VoidCallback onRedo;
   final VoidCallback onToggleLock;
   final void Function(int from, int to) onMove;
   final void Function(Set<String> assetIds, int to) onMoveItems;
@@ -3580,65 +3595,71 @@ class _StoryboardCanvas extends StatelessWidget {
               children: [
                 Padding(
                   padding: const EdgeInsets.fromLTRB(14, 12, 14, 8),
-                  child: Row(
-                    children: [
-                      Flexible(
-                        flex: 1,
-                        child: Text(
-                          board.name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleMedium
-                              ?.copyWith(fontWeight: FontWeight.w800),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        flex: 2,
-                        child: Text(
-                          '${board.width} x ${board.height} · ${board.rows} x ${board.columns} · ${board.portraitMode ? '竖屏单列' : '横屏宫格'} · 间距 ${board.gap.round()}',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(color: scheme.onSurfaceVariant),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Flexible(
-                        child: Text(
-                          state.message,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          textAlign: TextAlign.end,
-                          style: TextStyle(color: scheme.onSurfaceVariant),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Tooltip(
-                        message: board.locked ? '解锁画板' : '锁定画板',
-                        child: IconButton(
-                          isSelected: board.locked,
-                          onPressed: onToggleLock,
-                          icon: Icon(
-                            board.locked
-                                ? Icons.lock_rounded
-                                : Icons.lock_open_rounded,
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final compact = constraints.maxWidth < 520;
+                      final title = Text(
+                        board.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w800),
+                      );
+                      final historyActions = _StoryboardHistoryActions(
+                        canUndo: canUndo,
+                        canRedo: canRedo,
+                        locked: board.locked,
+                        onUndo: onUndo,
+                        onRedo: onRedo,
+                        onToggleLock: onToggleLock,
+                      );
+                      if (compact) {
+                        return SizedBox(
+                          height: 32,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              Positioned.fill(
+                                right: 102,
+                                child: Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: title,
+                                ),
+                              ),
+                              Positioned(right: 0, child: historyActions),
+                            ],
                           ),
-                          style: IconButton.styleFrom(
-                            foregroundColor: board.locked
-                                ? scheme.onPrimaryContainer
-                                : scheme.onSurfaceVariant,
-                            backgroundColor: board.locked
-                                ? scheme.primaryContainer.withValues(
-                                    alpha: 0.86,
-                                  )
-                                : Colors.transparent,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(8),
+                        );
+                      }
+                      return Row(
+                        children: [
+                          Expanded(flex: 2, child: title),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            flex: 3,
+                            child: Text(
+                              '${board.width} x ${board.height} · ${board.rows} x ${board.columns} · ${board.portraitMode ? '竖屏单列' : '横屏宫格'} · 间距 ${board.gap.round()}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(color: scheme.onSurfaceVariant),
                             ),
                           ),
-                        ),
-                      ),
-                    ],
+                          const SizedBox(width: 8),
+                          Flexible(
+                            flex: 2,
+                            child: Text(
+                              state.message,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              textAlign: TextAlign.end,
+                              style: TextStyle(color: scheme.onSurfaceVariant),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          historyActions,
+                        ],
+                      );
+                    },
                   ),
                 ),
                 Expanded(
@@ -3660,6 +3681,92 @@ class _StoryboardCanvas extends StatelessWidget {
                 ),
               ],
             ),
+    );
+  }
+}
+
+class _StoryboardHistoryActions extends StatelessWidget {
+  const _StoryboardHistoryActions({
+    required this.canUndo,
+    required this.canRedo,
+    required this.locked,
+    required this.onUndo,
+    required this.onRedo,
+    required this.onToggleLock,
+  });
+
+  final bool canUndo;
+  final bool canRedo;
+  final bool locked;
+  final VoidCallback onUndo;
+  final VoidCallback onRedo;
+  final VoidCallback onToggleLock;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      width: 96,
+      height: 32,
+      child: Row(
+        children: [
+          _button(
+            tooltip: '撤销 (Ctrl+Z)',
+            key: const ValueKey('storyboard-undo'),
+            onPressed: canUndo ? onUndo : null,
+            icon: Icons.undo_rounded,
+          ),
+          _button(
+            tooltip: '恢复 (Ctrl+Y / Ctrl+Shift+Z)',
+            key: const ValueKey('storyboard-redo'),
+            onPressed: canRedo ? onRedo : null,
+            icon: Icons.redo_rounded,
+          ),
+          _button(
+            tooltip: locked ? '解锁画板' : '锁定画板',
+            onPressed: onToggleLock,
+            icon: locked ? Icons.lock_rounded : Icons.lock_open_rounded,
+            foregroundColor: locked
+                ? scheme.onPrimaryContainer
+                : scheme.onSurfaceVariant,
+            backgroundColor: locked
+                ? scheme.primaryContainer.withValues(alpha: 0.86)
+                : Colors.transparent,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _button({
+    required String tooltip,
+    Key? key,
+    required VoidCallback? onPressed,
+    required IconData icon,
+    Color? foregroundColor,
+    Color? backgroundColor,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: SizedBox.square(
+        dimension: 32,
+        child: IconButton(
+          key: key,
+          onPressed: onPressed,
+          icon: Icon(icon),
+          iconSize: 19,
+          padding: EdgeInsets.zero,
+          style: IconButton.styleFrom(
+            minimumSize: const Size.square(32),
+            maximumSize: const Size.square(32),
+            foregroundColor: foregroundColor,
+            backgroundColor: backgroundColor,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -6441,6 +6548,7 @@ class _EmptyStoryboardSlot extends StatelessWidget {
         ? canvasColors.accent
         : canvasColors.slotBorder;
     return AnimatedContainer(
+      key: ValueKey('storyboard-empty-slot-$index'),
       duration: const Duration(milliseconds: 180),
       decoration: BoxDecoration(
         color: canvasColors.slotBackground,

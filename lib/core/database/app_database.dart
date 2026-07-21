@@ -970,6 +970,20 @@ class AppDatabase {
     }).toList();
   }
 
+  void updateCutResultPathAndIndex(String id, String path, int indexNo) {
+    _database.execute(
+      'UPDATE cut_results SET path = ?, index_no = ? WHERE id = ?;',
+      [path, indexNo, id],
+    );
+  }
+
+  void updateImportedImageStoredPath(String imageId, String path) {
+    _database.execute(
+      'UPDATE imported_images SET stored_path = ? WHERE id = ?;',
+      [path, imageId],
+    );
+  }
+
   void insertVisionAnalysisRun({
     required String id,
     required String boardId,
@@ -1317,6 +1331,27 @@ class AppDatabase {
       return null;
     }
     return _imageGenerationRecordFromRow(rows.first);
+  }
+
+  List<ImageGenerationRecord> listImageGenerationRecords() {
+    return _database
+        .select('SELECT * FROM image_generation_records ORDER BY created_at;')
+        .map(_imageGenerationRecordFromRow)
+        .toList();
+  }
+
+  void updateImageGenerationResultPathByAssetId(
+    String resultAssetId,
+    String resultPath,
+  ) {
+    _database.execute(
+      '''
+      UPDATE image_generation_records
+      SET result_path = ?, updated_at = ?
+      WHERE result_asset_id = ?;
+      ''',
+      [resultPath, DateTime.now().toIso8601String(), resultAssetId],
+    );
   }
 
   VisionAnalysisRunRecord _visionAnalysisRunFromRow(Row row) {

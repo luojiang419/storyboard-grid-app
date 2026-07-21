@@ -1,5 +1,5 @@
 #define MyAppName "故事板"
-#define MyAppVersion "1.0.0.87"
+#define MyAppVersion "1.0.0.93"
 #define MyAppPublisher "Jiang"
 #define MyAppExeName "storyboard_grid_app.exe"
 

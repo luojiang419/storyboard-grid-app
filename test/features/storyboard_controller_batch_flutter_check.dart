@@ -51,6 +51,13 @@ void main() {
     expect(controller.value.selectedBoard!.gap, 18);
     expect(controller.canRedoSelectedBoard, isTrue);
 
+    controller.setGap(18);
+    expect(
+      controller.canRedoSelectedBoard,
+      isTrue,
+      reason: '无变化操作不应污染历史或清空恢复栈',
+    );
+
     controller.undoSelectedBoard();
     expect(controller.value.selectedBoard!.rows, 3);
     expect(controller.value.selectedBoard!.columns, 3);
@@ -61,6 +68,16 @@ void main() {
 
     controller.setResolution(1600, 0);
     expect(controller.canRedoSelectedBoard, isFalse);
+  });
+
+  test('无效移除不会产生伪撤销记录', () async {
+    final fixture = await _createFixture();
+    final controller = fixture.controller;
+
+    controller.removeAsset('not-exists');
+
+    expect(controller.value.selectedBoard!.items, isEmpty);
+    expect(controller.canUndoSelectedBoard, isFalse);
   });
 
   test('画板撤销历史最多保留100步', () async {
@@ -266,6 +283,24 @@ void main() {
     ]);
   });
 
+  test('左侧资源拖入格位后可完整撤销并恢复', () async {
+    final fixture = await _createFixture();
+    final controller = fixture.controller;
+    final assets = [_asset(1), _asset(2), _asset(3)];
+    controller.setAssetsUsed(assets.take(2), true);
+    final beforeDrop = _itemIds(controller);
+
+    controller.placeAssetAtSlot(assets.last, 1);
+    expect(_itemIds(controller), ['asset-1', 'asset-3', 'asset-2']);
+
+    controller.undoSelectedBoard();
+    expect(_itemIds(controller), beforeDrop);
+    expect(controller.canRedoSelectedBoard, isTrue);
+
+    controller.redoSelectedBoard();
+    expect(_itemIds(controller), ['asset-1', 'asset-3', 'asset-2']);
+  });
+
   test('左侧已使用资源拖入格位时复用现有移动排序', () async {
     final fixture = await _createFixture();
     final controller = fixture.controller;
@@ -458,6 +493,54 @@ void main() {
     final finalItem = controller.value.selectedBoard!.itemAtSlot(0)!;
     expect(finalItem.caption, '连续替换仍保留说明');
     expect(finalItem.flipVertical, isTrue);
+  });
+
+  test('替换图片右键取消使用后可撤回恢复并重做', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'storyboard_replace_remove_history_',
+    );
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    final source = File(p.join(root.path, '待取消使用.png'));
+    await source.writeAsBytes(img.encodePng(img.Image(width: 3, height: 2)));
+
+    controller.setAssetsUsed([_asset(1)], true);
+    controller.updateCaption(0, '取消后仍可恢复的说明');
+    controller.toggleItemFlipHorizontal(0);
+    final original = controller.value.selectedBoard!.itemAtSlot(0)!;
+    expect(
+      await controller.replaceItemImage(item: original, imagePath: source.path),
+      isTrue,
+    );
+    final replacement = controller.value.selectedBoard!.itemAtSlot(0)!;
+    final copiedPath = replacement.asset.path;
+    await source.delete();
+
+    controller.removeAsset(replacement.asset.id);
+
+    expect(controller.value.selectedBoard!.items, isEmpty);
+    expect(controller.value.message, '已取消使用图片，可撤回恢复（最多100步）');
+    expect(File(copiedPath).existsSync(), isTrue);
+
+    controller.undoSelectedBoard();
+    final restored = controller.value.selectedBoard!.itemAtSlot(0)!;
+    expect(restored.asset.id, replacement.asset.id);
+    expect(restored.asset.path, copiedPath);
+    expect(File(restored.asset.path).existsSync(), isTrue);
+    expect(restored.caption, '取消后仍可恢复的说明');
+    expect(restored.flipHorizontal, isTrue);
+
+    controller.redoSelectedBoard();
+    expect(controller.value.selectedBoard!.items, isEmpty);
   });
 
   test('手动替换会拒绝无效图片且不改变当前格', () async {
@@ -1662,7 +1745,12 @@ void main() {
     final first = board.itemAtSlot(0)!;
     final second = board.itemAtSlot(1)!;
     expect(first.asset.id, startsWith('generated-cut-'));
-    expect(first.asset.path, fixture.imageService.resultPath);
+    expect(
+      p.basename(first.asset.path),
+      matches(RegExp(r'^001-画板 1-AI修改\.png$')),
+    );
+    expect(p.basename(first.asset.path), isNot('fake_result.png'));
+    expect(File(first.asset.path).existsSync(), isTrue);
     expect(first.caption, '保留当前说明');
     expect(first.flipHorizontal, isTrue);
     expect(second.asset.id, 'asset-2');
@@ -1681,6 +1769,95 @@ void main() {
     expect(
       controller.value.selectedBoard!.itemAtSlot(0)!.asset.id,
       generatedAssetId,
+    );
+  });
+
+  test('连续 AI 修改统一归档到单一目录并按画板名称递增编号', () async {
+    final fixture = await _createImageGenerationFixture();
+    final controller = fixture.controller;
+    final asset = await _registeredAsset(fixture.database, fixture.root, 1);
+    controller.setAssetsUsed([asset], true);
+    controller.renameSelectedBoard('春日:镜头');
+
+    for (var index = 0; index < 2; index++) {
+      final current = controller.value.selectedBoard!.itemAtSlot(0)!;
+      expect(
+        await controller.generateReplacementForItem(
+          item: current,
+          prompt: '保持构图并调整光线 $index',
+          model: 'nano-banana-fast',
+          aspectRatio: '16:9',
+          imageSize: '2K',
+          quality: 'auto',
+          extraReferenceImagePaths: const [],
+        ),
+        isTrue,
+      );
+    }
+
+    final generated = controller.value.assets
+        .where((asset) => asset.id.startsWith('generated-cut-'))
+        .toList();
+    expect(generated, hasLength(2));
+    expect(generated.map((asset) => asset.imageId).toSet(), hasLength(1));
+    expect(generated.map((asset) => asset.sourceName).toSet(), {'AI修改'});
+    expect(generated.map((asset) => asset.indexNo), [2, 1]);
+
+    final archive = Directory(
+      p.join(fixture.directories.generatedImages.path, 'AI修改'),
+    );
+    final names =
+        archive
+            .listSync()
+            .whereType<File>()
+            .map((file) => p.basename(file.path))
+            .toList()
+          ..sort();
+    expect(names, ['001-春日_镜头-AI修改.png', '002-春日_镜头-AI修改.png']);
+    expect(
+      fixture.directories.generatedImages.listSync().whereType<Directory>(),
+      hasLength(1),
+    );
+  });
+
+  test('旧版分散 AI 修改结果会迁移到统一目录并合并为一个来源组', () async {
+    final root = await Directory.systemTemp.createTemp(
+      'storyboard_ai_migrate_',
+    );
+    final directories = await AppDirectories.create(executableDirectory: root);
+    final database = await AppDatabase.open(directories.databaseFile);
+    final controller = StoryboardController(
+      database: database,
+      directories: directories,
+    );
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+    await _registerLegacyGeneratedAsset(database, directories, 1);
+    await _registerLegacyGeneratedAsset(database, directories, 2);
+
+    await controller.refreshAssets();
+
+    final generated = controller.value.assets
+        .where((asset) => asset.id.startsWith('generated-cut-'))
+        .toList();
+    expect(generated, hasLength(2));
+    expect(generated.map((asset) => asset.imageId).toSet(), {
+      'storyboard-ai-edited-images',
+    });
+    expect(generated.map((asset) => asset.sourceName).toSet(), {'AI修改'});
+    expect(generated.map((asset) => asset.indexNo).toList()..sort(), [1, 2]);
+    for (final asset in generated) {
+      expect(p.basename(p.dirname(asset.path)), 'AI修改');
+      expect(File(asset.path).existsSync(), isTrue);
+    }
+    expect(
+      directories.generatedImages.listSync().whereType<Directory>().map(
+        (directory) => p.basename(directory.path),
+      ),
+      ['AI修改'],
     );
   });
 
@@ -1813,6 +1990,7 @@ _createVisionFixture({_FakeVisionStoryboardService? visionService}) async {
 Future<
   ({
     Directory root,
+    AppDirectories directories,
     AppDatabase database,
     SettingsController settingsController,
     _FakeImageGenerationService imageService,
@@ -1852,11 +2030,61 @@ _createImageGenerationFixture({
   });
   return (
     root: root,
+    directories: directories,
     database: database,
     settingsController: settingsController,
     imageService: imageService,
     controller: controller,
   );
+}
+
+Future<void> _registerLegacyGeneratedAsset(
+  AppDatabase database,
+  AppDirectories directories,
+  int index,
+) async {
+  final legacyDirectory = Directory(
+    p.join(directories.generatedImages.path, 'legacy-board-$index'),
+  );
+  await legacyDirectory.create(recursive: true);
+  final file = File(p.join(legacyDirectory.path, 'generated-$index.png'));
+  await file.writeAsBytes(
+    img.encodePng(img.Image(width: 4 + index, height: 3 + index)),
+  );
+  final imageId = 'legacy-generated-image-$index';
+  final taskId = 'legacy-generated-task-$index';
+  final assetId = 'generated-cut-legacy-$index';
+  final now = DateTime.now().add(Duration(seconds: index)).toIso8601String();
+  database
+    ..upsertImportedImage(
+      id: imageId,
+      originalPath: file.path,
+      originalName: 'AI修改_旧图$index.png',
+      storedPath: file.path,
+      width: 4 + index,
+      height: 3 + index,
+      createdAt: now,
+    )
+    ..upsertCutTask(
+      id: taskId,
+      imageId: imageId,
+      status: 'generated',
+      rows: 1,
+      columns: 1,
+      confidence: 1,
+    )
+    ..insertCutResult(
+      id: assetId,
+      taskId: taskId,
+      imageId: imageId,
+      indexNo: 1,
+      path: file.path,
+      x: 0,
+      y: 0,
+      width: 4 + index,
+      height: 3 + index,
+      selected: true,
+    );
 }
 
 StoryboardCutAsset _asset(int index) {
