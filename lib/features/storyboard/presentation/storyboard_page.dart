@@ -285,8 +285,9 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
                               onFlipVertical: controller.toggleItemFlipVertical,
                               onEditImage: (item) =>
                                   _showImageEditDialog(controller, item),
-                              onLocateAsset: (item) =>
-                                  unawaited(_locateAssetInSidebar(item.asset)),
+                              onLocateAsset: (item) => unawaited(
+                                _locateAssetInSidebar(controller, item.asset),
+                              ),
                               onPickReplacementImage: (item) => unawaited(
                                 _pickReplacementImage(controller, item),
                               ),
@@ -400,7 +401,10 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
     );
   }
 
-  Future<void> _locateAssetInSidebar(StoryboardCutAsset asset) async {
+  Future<void> _locateAssetInSidebar(
+    StoryboardController controller,
+    StoryboardCutAsset asset,
+  ) async {
     if (!_assetSidebarExpanded) {
       _setAssetSidebarExpanded(true);
       await WidgetsBinding.instance.endOfFrame;
@@ -413,6 +417,15 @@ class _StoryboardPageState extends ConsumerState<StoryboardPage> {
         break;
       }
       await WidgetsBinding.instance.endOfFrame;
+    }
+    if (!located && mounted) {
+      await controller.refreshAssets();
+      if (!mounted) {
+        return;
+      }
+      await WidgetsBinding.instance.endOfFrame;
+      located =
+          await _assetSidebarKey.currentState?.locateAsset(asset) ?? false;
     }
     if (!mounted || located) {
       return;

@@ -1488,6 +1488,116 @@ void main() {
       ..clearLiveImages();
   });
 
+  testWidgets('重启后定位画板图片会等待左侧资源恢复', (tester) async {
+    tester.view.physicalSize = const Size(1400, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    late final Directory root;
+    late final AppDatabase database;
+    late final StoryboardController controller;
+    const imageId = 'restart-locate-source';
+    const assetId = 'restart-locate-asset';
+    await tester.runAsync(() async {
+      root = await Directory.systemTemp.createTemp(
+        'storyboard_restart_locate_asset_',
+      );
+      database = await AppDatabase.open(
+        File('${root.path}${Platform.pathSeparator}storyboard.sqlite'),
+      );
+      final image = File(
+        '${Directory.current.path}${Platform.pathSeparator}assets'
+        '${Platform.pathSeparator}branding${Platform.pathSeparator}app_icon_512.png',
+      );
+      expect(image.existsSync(), isTrue);
+      final now = DateTime.now().toIso8601String();
+      database
+        ..upsertImportedImage(
+          id: imageId,
+          originalPath: image.path,
+          originalName: '重启定位素材',
+          storedPath: image.path,
+          width: 1,
+          height: 1,
+          createdAt: now,
+        )
+        ..upsertCutTask(
+          id: 'restart-locate-task',
+          imageId: imageId,
+          status: 'exported',
+          rows: 1,
+          columns: 1,
+          confidence: 1,
+        )
+        ..insertCutResult(
+          id: assetId,
+          taskId: 'restart-locate-task',
+          imageId: imageId,
+          indexNo: 1,
+          path: image.path,
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 1,
+          selected: true,
+        );
+      final firstController = StoryboardController(database: database);
+      await firstController.refreshAssets();
+      firstController.addOrRemoveAsset(firstController.value.assets.single);
+      firstController.flushWorkspaceSnapshot();
+      firstController.dispose();
+
+      controller = StoryboardController(database: database);
+      expect(controller.value.assets, isEmpty);
+      expect(controller.value.selectedBoard!.items, hasLength(1));
+    });
+    addTearDown(() async {
+      controller.dispose();
+      database.dispose();
+      await root.delete(recursive: true);
+    });
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appDatabaseProvider.overrideWithValue(database),
+          storyboardControllerProvider.overrideWithValue(controller),
+        ],
+        child: MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: AppTheme.dark(),
+          home: const Scaffold(body: StoryboardPage()),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.tap(find.byKey(const ValueKey('storyboard-image-$assetId')));
+    await tester.pump();
+    await tester.tap(find.byTooltip('打开图片路径'));
+    await tester.runAsync(() async {
+      for (
+        var attempt = 0;
+        attempt < 100 && controller.value.assets.isEmpty;
+        attempt++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+    });
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey('asset-located-$assetId')),
+      findsOneWidget,
+    );
+    expect(find.text('左侧栏中未找到该图片资源'), findsNothing);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    PaintingBinding.instance.imageCache
+      ..clear()
+      ..clearLiveImages();
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+
   testWidgets('替换图片从右键菜单取消使用后可撤回恢复', (tester) async {
     late final Directory root;
     late final AppDirectories directories;
